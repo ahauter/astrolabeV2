@@ -1,5 +1,13 @@
 __pycache__/
 *.pyc
+.pytest_cache/
 
 scraped_code/
 scrape_test/
+
+# build artifacts
+/ast-tokenize
+
+# pretraining outputs
+/data/
+/checkpoints/
