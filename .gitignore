@@ -11,3 +11,6 @@ scrape_test/
 # pretraining outputs
 /data/
 /checkpoints/
+
+# environment variables
+.env
