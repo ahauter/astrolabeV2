@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+
+scraped_code/
+scrape_test/
