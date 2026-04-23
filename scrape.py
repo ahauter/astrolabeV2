@@ -197,10 +197,10 @@ async def seed_queue_with_search(session, query: str, max_pages: int):
         url = _next_link(headers.get("Link", ""))
 
 
-async def drain_queue(session):
+async def drain_queue(session, concurrency: int = 20):
     while request_queue:
         batch = []
-        while request_queue:
+        while request_queue and len(batch) < concurrency:
             t = request_queue.pop()
             batch.append(
                 fetch_data_callback(
@@ -234,7 +234,7 @@ async def main_async(args):
         )
 
         await seed_queue_with_search(session, args.query, args.max_pages)
-        await drain_queue(session)
+        await drain_queue(session, args.concurrency)
 
 
 def parse_args():
@@ -249,6 +249,8 @@ def parse_args():
                    help="Max search pages @ 30 repos/page (default: %(default)s)")
     p.add_argument("--max-file-bytes", type=int, default=DEFAULT_MAX_FILE_BYTES,
                    help="Skip files larger than N bytes (default: %(default)s)")
+    p.add_argument("--concurrency", type=int, default=20,
+                   help="Max simultaneous in-flight requests (default: %(default)s)")
     return p.parse_args()
 
 

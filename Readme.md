@@ -78,9 +78,39 @@ The Go→token converter lives in `cmd/ast-tokenize/`. Python code reads the str
 
 -----
 
+## Architecture
+
+The model is an **encoder-decoder transformer**:
+
+- **Encoder** — bidirectional attention over the full AST token stream. Builds a rich structural representation of the code without causal masking, so every token attends to the full context around it.
+- **Decoder** — autoregressive generation over the same AST token vocabulary, conditioned on the encoder's output. At inference the decoder emits the input stream back with `ASSERT_*` tokens inserted inline at the positions it identifies as unguarded.
+
+Four assertion intent tokens are added to the vocabulary:
+
+```
+ASSERT_NIL       NAME_X               # NAME_X may be nil before dereference
+ASSERT_BOUNDS    NAME_X  NAME_Y       # NAME_X may be >= len(NAME_Y)
+ASSERT_NONZERO   NAME_X               # NAME_X may be zero (divisor, modulo)
+ASSERT_INVARIANT NAME_X  ...          # general precondition on NAME_X
+```
+
+These tokens carry only structural intent. The actual variable names are recovered post-inference by looking up the `NAME_N` index in the AST scope stack — the model never needs to know that `NAME_3` is `userID`. The assertion is then rendered into real Go syntax by a lightweight template pass.
+
+-----
+
 ## Pretraining
 
-The model is a small decoder-only transformer (nanoGPT-style, pre-norm, weight-tied embeddings) trained with next-token prediction over packed AST-token streams from a large MIT-licensed Go corpus. The causal LM objective on open/close-paired tokens gives the model a **syntactic and scoping prior** before any task-specific RL, so fine-tuning isn't exploring from zero.
+Pretraining has two stages:
+
+**Stage 1 — Causal LM** (decoder-only, existing pipeline): next-token prediction over packed AST token streams. Gives the model a syntactic and scoping prior — bracket balancing, scope nesting, typical Go structural patterns — before any task-specific objective.
+
+**Stage 2 — Masked span prediction** (encoder-decoder): nil-check and bounds-check spans in real code are identified and replaced with their corresponding `ASSERT_*` token in the target stream. The model learns to predict `ASSERT_NIL NAME_X` from the surrounding structural context, directly pretraining the assertion insertion capability on real Go code written by real engineers.
+
+```
+input:   ... OPEN_IF OPEN_BINOP NAME_3 OP_EQL BI_NIL CLOSE_BINOP ... OPEN_STAR NAME_3 ...
+         (nil check span masked out)
+target:  ... [ASSERT_NIL NAME_3] OPEN_STAR NAME_3 ...
+```
 
 Pipeline:
 
@@ -88,7 +118,8 @@ Pipeline:
 scrape.py            → scraped_code/<repo>/**/*.go      # raw Go files
 ast-tokenize         → one token per line on stdout      # structural stream
 astrolabe.prepare    → data/train.bin, data/val.bin     # packed uint16 IDs
-astrolabe.train      → checkpoints/ckpt_<step>.pt       # trained model
+astrolabe.train      → checkpoints/ckpt_<step>.pt       # stage 1: causal LM
+astrolabe.pretrain2  → checkpoints/ckpt_enc_<step>.pt   # stage 2: masked spans
 ```
 
 Eval during pretraining logs validation loss plus **bracket-balance rate** on sampled generations — the fraction of open tokens whose matching close appears correctly nested. That's a cheap, meaningful validity metric unique to this tokenization: random generations score ~0%, and a well-trained model should climb into the 90s.
@@ -98,16 +129,20 @@ Build and run:
 ```bash
 go build ./cmd/ast-tokenize
 export GITHUB_TOKEN=ghp_...          # strongly recommended
-python scrape.py --max-pages 20 --output-dir scraped_code
+python scrape.py --max-pages 33 --output-dir scraped_code
 python -m astrolabe.prepare --src scraped_code --dst data
 python -m astrolabe.train  --data-dir data --out-dir checkpoints
 ```
 
 -----
 
-## Training Data
+## Fine-Tuning Data
 
-Fine-tuning data is generated automatically using a weak language model deliberately prompted to write buggy code:
+Fine-tuning data comes from two sources:
+
+**Hand-labelled corpus samples** — a subset of the pretraining corpus is manually annotated with assertion sites and known unsafe patterns. Small volume, high signal.
+
+**Synthetic generation** — a weak language model is deliberately prompted to write buggy code:
 
 ```
 Write a Go function implementing {algorithm}.
