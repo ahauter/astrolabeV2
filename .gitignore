@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+.venv
 
 scraped_code/
 scrape_test/
@@ -14,3 +15,6 @@ scrape_test/
 
 # environment variables
 .env
+
+# Claude
+.claude
