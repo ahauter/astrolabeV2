@@ -12,6 +12,9 @@ scrape_test/
 # pretraining outputs
 /data/
 /checkpoints/
+/checkpoints_risk/
+/checkpoints_risk_v2/
+/checkpoints_risk_v3/
 
 # environment variables
 .env
