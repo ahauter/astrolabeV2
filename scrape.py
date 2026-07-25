@@ -1,11 +1,16 @@
-"""Scrape Go source files from MIT-licensed GitHub repos for AST pretraining.
+"""Scrape Go source files from permissively-licensed GitHub repos for AST pretraining.
 
 Usage:
     export GITHUB_TOKEN=ghp_...   # optional but strongly recommended
     python scrape.py --max-pages 10 --output-dir scraped_code
 
+Pass --query multiple times to cover multiple licenses in one run:
+    python scrape.py --query "language:Go license:mit sort:updated-desc" \
+                     --query "language:Go license:apache-2.0 sort:updated-desc"
+
 Writes files to <output-dir>/<owner>__<repo>/<path/in/repo>. Re-runs skip repos
 already listed in <output-dir>/.seen-repos so incremental scrapes are safe.
+Auto-generated Go files (*.pb.go, *_gen.go, wire_gen.go, etc.) are skipped.
 """
 import argparse
 import asyncio
@@ -18,12 +23,23 @@ from urllib.parse import quote_plus
 import aiohttp
 
 
-DEFAULT_QUERY = "language:Go license:mit"
+DEFAULT_QUERIES = [
+    "language:Go license:mit sort:updated-desc",
+    "language:Go license:apache-2.0 sort:updated-desc",
+    "language:Go license:bsd-2-clause sort:updated-desc",
+    "language:Go license:bsd-3-clause sort:updated-desc",
+    "language:Go license:isc sort:updated-desc",
+    "language:Go license:mpl-2.0 sort:updated-desc",
+]
 DEFAULT_OUTPUT = "scraped_code"
 DEFAULT_MAX_PAGES = 10
 DEFAULT_MAX_FILE_BYTES = 500 * 1024
 ALLOWED_EXTENSIONS = {"go"}
 SEEN_REPOS_FILE = ".seen-repos"
+
+AUTOGEN_SUFFIXES = ("_gen.go", "_generated.go", ".pb.go", ".pb.gw.go")
+AUTOGEN_PREFIXES = ("zz_generated", "mock_", "fake_")
+AUTOGEN_EXACT = {"bindata.go", "wire_gen.go"}
 
 request_queue: list = []
 seen_repos: set = set()
@@ -49,13 +65,16 @@ async def _request(session: aiohttp.ClientSession, url: str, use_json: bool):
             if response.status in (403, 429):
                 remaining = response.headers.get("X-RateLimit-Remaining")
                 reset = response.headers.get("X-RateLimit-Reset")
-                if remaining == "0" and reset:
+                if reset and (remaining == "0" or response.status == 429):
                     wait = max(0, int(reset) - int(time.time())) + random.uniform(1, 5)
                     print(f"rate-limited; sleeping {wait:.1f}s until reset", flush=True)
                     await asyncio.sleep(wait)
                     continue
-                body = await response.text()
-                raise RuntimeError(f"GitHub {response.status}: {body[:200]}")
+                # secondary rate limit — no reset header, back off and retry
+                wait = random.uniform(60, 90)
+                print(f"secondary rate limit; sleeping {wait:.1f}s", flush=True)
+                await asyncio.sleep(wait)
+                continue
             response.raise_for_status()
             headers = dict(response.headers)
             if use_json:
@@ -115,6 +134,13 @@ def parse_contents_res(result, repo_slug: str):
         name = entry.get("name", "")
         ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
         if ext not in ALLOWED_EXTENSIONS:
+            continue
+        if (
+            name in AUTOGEN_EXACT
+            or any(name.endswith(s) for s in AUTOGEN_SUFFIXES)
+            or any(name.startswith(p) for p in AUTOGEN_PREFIXES)
+        ):
+            print(f"skip (autogen): {entry.get('path')}", flush=True)
             continue
         size = entry.get("size", 0)
         if size and size > config["max_file_bytes"]:
@@ -233,7 +259,9 @@ async def main_async(args):
             flush=True,
         )
 
-        await seed_queue_with_search(session, args.query, args.max_pages)
+        for query in args.queries:
+            print(f"seeding: {query}", flush=True)
+            await seed_queue_with_search(session, query, args.max_pages)
         await drain_queue(session, args.concurrency)
 
 
@@ -241,8 +269,10 @@ def parse_args():
     p = argparse.ArgumentParser(
         description="Scrape Go source files from MIT-licensed GitHub repos."
     )
-    p.add_argument("--query", default=DEFAULT_QUERY,
-                   help="GitHub search query (default: %(default)s)")
+    p.add_argument("--query", dest="queries", action="append", default=None,
+                   metavar="QUERY",
+                   help="GitHub search query; repeat to run multiple queries. "
+                        "Defaults to all permissive licenses if omitted.")
     p.add_argument("--output-dir", default=DEFAULT_OUTPUT,
                    help="Output directory (default: %(default)s)")
     p.add_argument("--max-pages", type=int, default=DEFAULT_MAX_PAGES,
@@ -251,7 +281,10 @@ def parse_args():
                    help="Skip files larger than N bytes (default: %(default)s)")
     p.add_argument("--concurrency", type=int, default=20,
                    help="Max simultaneous in-flight requests (default: %(default)s)")
-    return p.parse_args()
+    args = p.parse_args()
+    if args.queries is None:
+        args.queries = DEFAULT_QUERIES
+    return args
 
 
 if __name__ == "__main__":

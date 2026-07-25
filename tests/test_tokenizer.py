@@ -20,7 +20,10 @@ def tokenize(src: str, tmp_path: Path) -> list[str]:
     p = tmp_path / "snippet.go"
     p.write_text(src)
     out = subprocess.check_output([str(HELPER), str(p)], text=True)
-    return [line for line in out.splitlines() if line]
+    return [
+        line for line in out.splitlines()
+        if line and not line.startswith(("ANN ", "POSMAP ", "PKGS ", "NAMEPOSMAP "))
+    ]
 
 
 def test_brackets_balance(tmp_path):

@@ -1,11 +1,13 @@
-"""AST-token pretraining loop with CFG auxiliary heads.
+"""Fine-tune pretrained GPT with risk classification heads.
 
-Five simultaneous objectives: LM (next-token), block-boundary (BB), def-use
-(DU), edge-type (Edge), and dominance (DOM).  CFG losses are weighted by the
-cfg_*_weight fields in TrainConfig; set any weight to 0 to disable that head.
+Loads a pretrained checkpoint, freezes backbone for N steps, then low-LR
+fine-tunes the full model on nil-deref + bounds-check binary labels.
 
 Usage:
-    python -m astrolabe.train --data-dir data --out-dir checkpoints
+    python -m astrolabe.finetune_risk \
+        --data-dir data \
+        --out-dir checkpoints_risk_v3 \
+        --resume checkpoints/ckpt_100000.pt
 """
 from __future__ import annotations
 
@@ -18,13 +20,13 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader
 
-from astrolabe.config import TrainConfig
-from astrolabe.dataset import CFGUnitMixDataset
+from astrolabe.config import RiskTrainConfig
+from astrolabe.risk_dataset import RiskUnitDataset
 from astrolabe.model import GPT, GPTConfig
 from astrolabe.vocab import BOS_ID, VOCAB_SIZE, bracket_balance_rate
 
 
-def get_lr(step: int, cfg: TrainConfig) -> float:
+def get_lr(step: int, cfg: RiskTrainConfig) -> float:
     if step < cfg.warmup_steps:
         return cfg.lr * (step + 1) / cfg.warmup_steps
     if step >= cfg.max_steps:
@@ -41,7 +43,7 @@ def _to(batch: tuple, device: str) -> tuple:
 @torch.no_grad()
 def evaluate(model: GPT, loader: DataLoader, device: str, iters: int) -> dict[str, float]:
     model.eval()
-    totals: dict[str, float] = {k: 0.0 for k in ("lm", "bb", "du", "edge", "dom")}
+    totals: dict[str, float] = {k: 0.0 for k in ("total", "nil", "bounds")}
     counts: dict[str, int] = {k: 0 for k in totals}
     it = iter(loader)
     for _ in range(iters):
@@ -49,31 +51,28 @@ def evaluate(model: GPT, loader: DataLoader, device: str, iters: int) -> dict[st
             batch = next(it)
         except StopIteration:
             break
-        x, y, bb_l, du_p, edge_l, dom_p = _to(batch, device)
-        _, lm, bb, du, edge, dom = model(x, y, bb_l, du_p, edge_l, dom_p)
-        for name, val in (("lm", lm), ("bb", bb), ("du", du), ("edge", edge), ("dom", dom)):
-            if val is not None:
-                totals[name] += val.item()
-                counts[name] += 1
+        x, y, nil_l, bounds_l = _to(batch, device)
+        _, lm, bb, du, edge, dom, nil_loss, bounds_loss = model(
+            x, y, None, None, None, None, nil_l, bounds_l
+        )
+        loss = 0.0
+        if nil_loss is not None:
+            loss += nil_loss.item()
+            totals["nil"] += nil_loss.item()
+            counts["nil"] += 1
+        if bounds_loss is not None:
+            loss += bounds_loss.item()
+            totals["bounds"] += bounds_loss.item()
+            counts["bounds"] += 1
+        totals["total"] += loss
+        counts["total"] += 1
     model.train()
     return {k: totals[k] / max(1, counts[k]) for k in totals}
 
 
-@torch.no_grad()
-def sample_balance(model: GPT, device: str, n_tokens: int, n_samples: int = 8) -> float:
-    model.eval()
-    rates = []
-    for _ in range(n_samples):
-        start = torch.tensor([[BOS_ID]], dtype=torch.long, device=device)
-        out = model.generate(start, max_new_tokens=n_tokens, temperature=1.0, top_k=40)
-        rates.append(bracket_balance_rate(out[0].tolist()))
-    model.train()
-    return sum(rates) / len(rates)
-
-
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
-    cfg = TrainConfig()
+    cfg = RiskTrainConfig()
     for k, v in asdict(cfg).items():
         kind = type(v)
         flag = "--" + k.replace("_", "-")
@@ -84,16 +83,20 @@ def parse_args() -> argparse.Namespace:
             p.add_argument(flag, type=Path, default=v)
         else:
             p.add_argument(flag, type=kind, default=v)
-    p.add_argument("--resume", type=Path, default=None,
-                   help="Checkpoint to resume from (model + optimizer state)")
+    p.add_argument("--resume", type=Path, required=True,
+                   help="Pretrained checkpoint to resume from")
+    p.add_argument("--max-units", type=int, default=None,
+                   help="Limit dataset to first N units (for POC)")
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     resume = args.resume
+    max_units = args.max_units
     del args.resume
-    cfg = TrainConfig(**vars(args))
+    del args.max_units
+    cfg = RiskTrainConfig(**vars(args))
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.bfloat16 if device == "cuda" and torch.cuda.is_bf16_supported() \
@@ -102,17 +105,21 @@ def main() -> None:
     torch.manual_seed(cfg.seed)
     cfg.out_dir.mkdir(parents=True, exist_ok=True)
 
-    train_ds = CFGUnitMixDataset(
+    train_ds = RiskUnitDataset(
         cfg.data_dir / "train_units.bin",
         cfg.data_dir / "train_units.idx.npy",
-        cfg.data_dir / "train_ann.jsonl",
+        None,
+        cfg.data_dir / "risk_train_v3.jsonl",
         cfg.block_size,
+        max_units=max_units,
     )
-    val_ds = CFGUnitMixDataset(
+    val_ds = RiskUnitDataset(
         cfg.data_dir / "val_units.bin",
         cfg.data_dir / "val_units.idx.npy",
-        cfg.data_dir / "val_ann.jsonl",
+        None,
+        cfg.data_dir / "risk_val_v3.jsonl",
         cfg.block_size,
+        max_units=max_units,
     )
     train_dl = DataLoader(train_ds, batch_size=cfg.batch_size, num_workers=0)
     val_dl   = DataLoader(val_ds,   batch_size=cfg.batch_size, num_workers=0)
@@ -140,14 +147,19 @@ def main() -> None:
     )
 
     step = 0
-    if resume is not None:
-        ckpt = torch.load(resume, map_location=device, weights_only=False)
-        model.load_state_dict(ckpt["model"])
-        opt.load_state_dict(ckpt["opt"])
-        step = ckpt["step"]
-        print(f"resumed from {resume} at step {step}")
+    ckpt = torch.load(resume, map_location=device, weights_only=False)
+    model.load_state_dict(ckpt["model"], strict=False)
+    # opt state from pretraining is not useful for new heads; skip it.
+    print(f"loaded pretrained checkpoint from {resume}")
 
-    running: dict[str, float] = {k: 0.0 for k in ("lm", "bb", "du", "edge", "dom", "total")}
+    # Freeze backbone parameters for first N steps.
+    risk_params = list(model.risk_nil_head.parameters()) + list(model.risk_bounds_head.parameters())
+    for p in model.parameters():
+        p.requires_grad = False
+    for p in risk_params:
+        p.requires_grad = True
+
+    running: dict[str, float] = {k: 0.0 for k in ("total", "nil", "bounds")}
     running_n = 0
     t0 = time.time()
     train_iter = iter(train_dl)
@@ -157,6 +169,12 @@ def main() -> None:
         for g in opt.param_groups:
             g["lr"] = lr
 
+        # Unfreeze backbone after freeze period.
+        if step == cfg.freeze_backbone_steps:
+            for p in model.parameters():
+                p.requires_grad = True
+            print(f"[step {step}] backbone unfrozen")
+
         opt.zero_grad(set_to_none=True)
         for _ in range(cfg.grad_accum_steps):
             try:
@@ -165,27 +183,20 @@ def main() -> None:
                 train_iter = iter(train_dl)
                 batch = next(train_iter)
 
-            x, y, bb_l, du_p, edge_l, dom_p = _to(batch, device)
+            x, y, nil_l, bounds_l = _to(batch, device)
             with torch.autocast(device_type=device, dtype=dtype, enabled=(device == "cuda")):
-                _, lm_loss, bb_loss, du_loss, edge_loss, dom_loss = model(
-                    x, y, bb_l, du_p, edge_l, dom_p
+                _, lm_loss, bb_loss, du_loss, edge_loss, dom_loss, nil_loss, bounds_loss = model(
+                    x, y, None, None, None, None, nil_l, bounds_l
                 )
-                loss = lm_loss
-                if bb_loss   is not None and cfg.cfg_bb_weight   > 0:
-                    loss = loss + cfg.cfg_bb_weight   * bb_loss
-                if du_loss   is not None and cfg.cfg_du_weight   > 0:
-                    loss = loss + cfg.cfg_du_weight   * du_loss
-                if edge_loss is not None and cfg.cfg_edge_weight > 0:
-                    loss = loss + cfg.cfg_edge_weight * edge_loss
-                if dom_loss  is not None and cfg.cfg_dom_weight  > 0:
-                    loss = loss + cfg.cfg_dom_weight  * dom_loss
+                loss = 0.0
+                if nil_loss is not None and cfg.risk_nil_weight > 0:
+                    loss = loss + cfg.risk_nil_weight * nil_loss
+                if bounds_loss is not None and cfg.risk_bounds_weight > 0:
+                    loss = loss + cfg.risk_bounds_weight * bounds_loss
                 loss = loss / cfg.grad_accum_steps
 
             loss.backward()
-            for name, val in (
-                ("lm", lm_loss), ("bb", bb_loss),
-                ("du", du_loss), ("edge", edge_loss), ("dom", dom_loss),
-            ):
+            for name, val in (("nil", nil_loss), ("bounds", bounds_loss)):
                 if val is not None:
                     running[name] += val.item()
             running["total"] += loss.item() * cfg.grad_accum_steps
@@ -200,7 +211,7 @@ def main() -> None:
             scale = max(1, running_n)
             parts = "  ".join(
                 f"{k} {running[k] / scale:.4f}"
-                for k in ("total", "lm", "bb", "du", "edge", "dom")
+                for k in ("total", "nil", "bounds")
             )
             dt = (time.time() - t0) / cfg.log_interval
             print(f"step {step:6d}  {parts}  lr {lr:.2e}  {dt*1000:.0f}ms/step", flush=True)
@@ -211,9 +222,8 @@ def main() -> None:
 
         if step % cfg.eval_interval == 0 or step == cfg.max_steps:
             eval_losses = evaluate(model, val_dl, device, cfg.eval_iters)
-            balance = sample_balance(model, device, cfg.sample_tokens)
             parts = "  ".join(f"val_{k} {v:.4f}" for k, v in eval_losses.items())
-            print(f"[eval] step {step}  {parts}  bracket_balance {balance:.3f}", flush=True)
+            print(f"[eval] step {step}  {parts}", flush=True)
             ckpt = {
                 "model": model.state_dict(),
                 "opt": opt.state_dict(),
@@ -221,7 +231,7 @@ def main() -> None:
                 "cfg": asdict(cfg),
                 "gpt_cfg": asdict(gpt_cfg),
             }
-            torch.save(ckpt, cfg.out_dir / f"ckpt_{step}.pt")
+            torch.save(ckpt, cfg.out_dir / f"ckpt_risk_{step}.pt")
 
 
 if __name__ == "__main__":

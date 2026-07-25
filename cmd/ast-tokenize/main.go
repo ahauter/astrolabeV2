@@ -16,6 +16,7 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"go/ast"
 	"go/parser"
@@ -24,6 +25,8 @@ import (
 	"path"
 	"strconv"
 	"strings"
+
+	"golang.org/x/tools/go/cfg"
 )
 
 const (
@@ -48,18 +51,67 @@ var predeclared = map[string]string{
 	"error": "T_ERROR", "any": "T_ANY", "comparable": "T_COMPARABLE",
 }
 
+// nameEvent records a single identifier definition or use within a function.
+type nameEvent struct {
+	pos  int    // token position from declaration start (0-indexed)
+	kind string // "def" or "use"
+	slot int    // NAME slot (0..nameSlots-1), or -1 for OVF/UNK
+	name string // original identifier string
+}
+
+// funcCtx holds per-function CFG data accumulated during the walk of a function declaration.
+type funcCtx struct {
+	nodeToBlock        map[ast.Node]*cfg.Block // real body AST node → its CFG block
+	rpoOrder           []*cfg.Block            // blocks in reverse post-order
+	rpoIndex           map[int32]int           // block.Index → RPO position
+	preds              map[int32][]*cfg.Block  // block.Index → predecessor blocks
+	blockStartPos      map[int32]int           // block.Index → first token position in declaration
+	blockEndPos        map[int32]int           // block.Index → last token position in declaration
+	blockStartRecorded map[int32]bool
+	nameEvents         []nameEvent
+}
+
+// cfgAnnotation is the JSON object emitted on "ANN {...}" lines after each function.
+type cfgAnnotation struct {
+	BB    []int                        `json:"bb"`
+	Def   []int                        `json:"def,omitempty"`
+	Use   []int                        `json:"use,omitempty"`
+	DU    map[string]int               `json:"du,omitempty"`
+	Edges map[string]map[string]string `json:"edges,omitempty"`
+	IDom  map[string]int               `json:"idom,omitempty"`
+}
+
 type emitter struct {
-	w          *bufio.Writer
-	nameStack  []string
-	scopeMarks []int
-	fields     map[string]int
+	w               *bufio.Writer
+	nameStack       []string
+	scopeMarks      []int
+	fields          map[string]int
+	funcCtx         *funcCtx // non-nil only inside a function declaration
+	tokenCount      int      // tokens emitted from declaration start (valid when funcCtx != nil)
+	fset            *token.FileSet
+	currentPos      token.Pos
+	globalTokCount  int
+	tokenLines      []int
+	namePosMap      map[int]string // global token index -> original identifier (for NAME_* tokens only)
 }
 
-func newEmitter(w *bufio.Writer) *emitter {
-	return &emitter{w: w, fields: map[string]int{}}
+func newEmitter(w *bufio.Writer, fset *token.FileSet) *emitter {
+	return &emitter{w: w, fields: map[string]int{}, fset: fset, namePosMap: map[int]string{}}
 }
 
-func (e *emitter) emit(tok string) { e.w.WriteString(tok); e.w.WriteByte('\n') }
+func (e *emitter) emit(tok string) {
+	e.w.WriteString(tok)
+	e.w.WriteByte('\n')
+	line := 1
+	if e.fset != nil && e.currentPos.IsValid() {
+		line = e.fset.Position(e.currentPos).Line
+	}
+	e.tokenLines = append(e.tokenLines, line)
+	e.globalTokCount++
+	if e.funcCtx != nil {
+		e.tokenCount++
+	}
+}
 
 func (e *emitter) enterScope() { e.scopeMarks = append(e.scopeMarks, len(e.nameStack)) }
 
@@ -82,9 +134,16 @@ func (e *emitter) introduce(name string) {
 	idx := len(e.nameStack) - 1
 	if idx >= nameSlots {
 		e.emit("NAME_OVF")
+		if e.funcCtx != nil {
+			e.funcCtx.nameEvents = append(e.funcCtx.nameEvents, nameEvent{e.tokenCount - 1, "def", -1, name})
+		}
 		return
 	}
 	e.emit("NAME_" + strconv.Itoa(idx))
+	e.namePosMap[e.globalTokCount-1] = name
+	if e.funcCtx != nil {
+		e.funcCtx.nameEvents = append(e.funcCtx.nameEvents, nameEvent{e.tokenCount - 1, "def", idx, name})
+	}
 }
 
 // register adds name to the innermost scope without emitting. Used during the
@@ -124,13 +183,23 @@ func (e *emitter) reference(name string) {
 		if e.nameStack[i] == name {
 			if i >= nameSlots {
 				e.emit("NAME_OVF")
+				if e.funcCtx != nil {
+					e.funcCtx.nameEvents = append(e.funcCtx.nameEvents, nameEvent{e.tokenCount - 1, "use", -1, name})
+				}
 				return
 			}
 			e.emit("NAME_" + strconv.Itoa(i))
+			e.namePosMap[e.globalTokCount-1] = name
+			if e.funcCtx != nil {
+				e.funcCtx.nameEvents = append(e.funcCtx.nameEvents, nameEvent{e.tokenCount - 1, "use", i, name})
+			}
 			return
 		}
 	}
 	e.emit("NAME_UNK")
+	if e.funcCtx != nil {
+		e.funcCtx.nameEvents = append(e.funcCtx.nameEvents, nameEvent{e.tokenCount - 1, "use", -2, name})
+	}
 }
 
 // field emits a FIELD token using a per-file index space, assigning a fresh
@@ -316,10 +385,286 @@ const (
 	referenceNames
 )
 
+// buildFuncCtx constructs a funcCtx for the given function body.
+func buildFuncCtx(g *cfg.CFG, body *ast.BlockStmt) *funcCtx {
+	// Collect real AST node pointers (excludes synthetic nodes injected by cfg.New).
+	realNodes := make(map[ast.Node]bool)
+	ast.Inspect(body, func(n ast.Node) bool {
+		if n != nil {
+			realNodes[n] = true
+		}
+		return true
+	})
+
+	// Compute RPO via iterative DFS from the entry block.
+	type frame struct {
+		blk     *cfg.Block
+		succIdx int
+	}
+	visited := make(map[int32]bool, len(g.Blocks))
+	postOrder := make([]*cfg.Block, 0, len(g.Blocks))
+	stack := []frame{{g.Blocks[0], 0}}
+	visited[g.Blocks[0].Index] = true
+	for len(stack) > 0 {
+		top := &stack[len(stack)-1]
+		if top.succIdx < len(top.blk.Succs) {
+			s := top.blk.Succs[top.succIdx]
+			top.succIdx++
+			if !visited[s.Index] {
+				visited[s.Index] = true
+				stack = append(stack, frame{s, 0})
+			}
+		} else {
+			postOrder = append(postOrder, top.blk)
+			stack = stack[:len(stack)-1]
+		}
+	}
+	rpoOrder := make([]*cfg.Block, len(postOrder))
+	for i, b := range postOrder {
+		rpoOrder[len(postOrder)-1-i] = b
+	}
+	rpoIndex := make(map[int32]int, len(rpoOrder))
+	for i, b := range rpoOrder {
+		rpoIndex[b.Index] = i
+	}
+
+	// Build predecessor map from successor edges.
+	preds := make(map[int32][]*cfg.Block, len(g.Blocks))
+	for _, blk := range g.Blocks {
+		for _, succ := range blk.Succs {
+			preds[succ.Index] = append(preds[succ.Index], blk)
+		}
+	}
+
+	// Map real AST nodes to their block.
+	nodeToBlock := make(map[ast.Node]*cfg.Block)
+	for _, blk := range g.Blocks {
+		for _, n := range blk.Nodes {
+			if realNodes[n] {
+				nodeToBlock[n] = blk
+			}
+		}
+	}
+
+	return &funcCtx{
+		nodeToBlock:        nodeToBlock,
+		rpoOrder:           rpoOrder,
+		rpoIndex:           rpoIndex,
+		preds:              preds,
+		blockStartPos:      make(map[int32]int),
+		blockEndPos:        make(map[int32]int),
+		blockStartRecorded: make(map[int32]bool),
+	}
+}
+
+// computeDominance computes immediate dominators using the Cooper/Harvey/Kennedy
+// iterative algorithm. Returns a map from block.Index to the block.Index of its
+// immediate dominator (-1 for the entry block).
+func computeDominance(rpoOrder []*cfg.Block, rpoIndex map[int32]int, preds map[int32][]*cfg.Block) map[int32]int32 {
+	if len(rpoOrder) == 0 {
+		return nil
+	}
+	// idom[i] = RPO index of immediate dominator of rpoOrder[i]; -1 = undefined.
+	idom := make([]int, len(rpoOrder))
+	for i := range idom {
+		idom[i] = -1
+	}
+	idom[0] = 0
+	changed := true
+	for changed {
+		changed = false
+		for i := 1; i < len(rpoOrder); i++ {
+			b := rpoOrder[i]
+			newIdom := -1
+			for _, pred := range preds[b.Index] {
+				pi, ok := rpoIndex[pred.Index]
+				if !ok || idom[pi] == -1 {
+					continue
+				}
+				if newIdom == -1 {
+					newIdom = pi
+				} else {
+					f1, f2 := pi, newIdom
+					for f1 != f2 {
+						for f1 > f2 {
+							f1 = idom[f1]
+						}
+						for f2 > f1 {
+							f2 = idom[f2]
+						}
+					}
+					newIdom = f1
+				}
+			}
+			if newIdom != -1 && idom[i] != newIdom {
+				idom[i] = newIdom
+				changed = true
+			}
+		}
+	}
+	result := make(map[int32]int32, len(rpoOrder))
+	for i, b := range rpoOrder {
+		if i == 0 {
+			result[b.Index] = -1
+		} else if idom[i] >= 0 {
+			result[b.Index] = rpoOrder[idom[i]].Index
+		}
+	}
+	return result
+}
+
+// buildAnnotation computes the cfgAnnotation from an accumulated funcCtx.
+func buildAnnotation(ctx *funcCtx) *cfgAnnotation {
+	if ctx == nil || len(ctx.rpoOrder) == 0 {
+		return nil
+	}
+	ann := &cfgAnnotation{
+		DU:    make(map[string]int),
+		Edges: make(map[string]map[string]string),
+		IDom:  make(map[string]int),
+	}
+
+	// BB: block start positions in RPO order.
+	for _, blk := range ctx.rpoOrder {
+		if pos, ok := ctx.blockStartPos[blk.Index]; ok {
+			ann.BB = append(ann.BB, pos)
+		}
+	}
+	if len(ann.BB) == 0 {
+		return nil
+	}
+
+	// Def/Use events.
+	for _, ev := range ctx.nameEvents {
+		if ev.kind == "def" {
+			ann.Def = append(ann.Def, ev.pos)
+		} else {
+			ann.Use = append(ann.Use, ev.pos)
+		}
+	}
+
+	// DU chains: for each use, find the most recent def with same (slot, name).
+	for _, useEv := range ctx.nameEvents {
+		if useEv.kind != "use" || useEv.slot < 0 {
+			continue
+		}
+		bestPos := -1
+		for _, defEv := range ctx.nameEvents {
+			if defEv.kind != "def" || defEv.slot != useEv.slot || defEv.name != useEv.name {
+				continue
+			}
+			if defEv.pos < useEv.pos && defEv.pos > bestPos {
+				bestPos = defEv.pos
+			}
+		}
+		if bestPos >= 0 {
+			ann.DU[strconv.Itoa(useEv.pos)] = bestPos
+		}
+	}
+
+	// Edges: block_exit_pos → {successor_entry_pos: edge_type}.
+	for _, blk := range ctx.rpoOrder {
+		exitPos, hasExit := ctx.blockEndPos[blk.Index]
+		if !hasExit || len(blk.Succs) == 0 {
+			continue
+		}
+		edgeMap := make(map[string]string)
+		for si, succ := range blk.Succs {
+			entryPos, hasEntry := ctx.blockStartPos[succ.Index]
+			if !hasEntry {
+				continue
+			}
+			var et string
+			switch {
+			case ctx.rpoIndex[succ.Index] < ctx.rpoIndex[blk.Index]:
+				et = "B"
+			case len(blk.Succs) == 2 && si == 0:
+				et = "T"
+			case len(blk.Succs) == 2:
+				et = "F"
+			default:
+				et = "U"
+			}
+			edgeMap[strconv.Itoa(entryPos)] = et
+		}
+		if len(edgeMap) > 0 {
+			ann.Edges[strconv.Itoa(exitPos)] = edgeMap
+		}
+	}
+
+	// IDom: compute and store immediate dominators keyed by block.Index.
+	idom := computeDominance(ctx.rpoOrder, ctx.rpoIndex, ctx.preds)
+	for blockIdx, domIdx := range idom {
+		ann.IDom[strconv.Itoa(int(blockIdx))] = int(domIdx)
+	}
+
+	return ann
+}
+
+// cfgNodeBefore silently records the token position at which we begin walking
+// an AST node. If the node is the first in its CFG block, records the block
+// start position.
+func (e *emitter) cfgNodeBefore(node ast.Node) {
+	if e.funcCtx == nil || node == nil {
+		return
+	}
+	blk, ok := e.funcCtx.nodeToBlock[node]
+	if !ok {
+		return
+	}
+	if !e.funcCtx.blockStartRecorded[blk.Index] {
+		e.funcCtx.blockStartPos[blk.Index] = e.tokenCount
+		e.funcCtx.blockStartRecorded[blk.Index] = true
+	}
+}
+
+// cfgNodeAfter silently records the token position after walking an AST node.
+// If the node is the last real node in its CFG block, records the block end position.
+func (e *emitter) cfgNodeAfter(node ast.Node) {
+	if e.funcCtx == nil || node == nil {
+		return
+	}
+	blk, ok := e.funcCtx.nodeToBlock[node]
+	if !ok {
+		return
+	}
+	var lastReal ast.Node
+	for _, n := range blk.Nodes {
+		if _, isReal := e.funcCtx.nodeToBlock[n]; isReal {
+			lastReal = n
+		}
+	}
+	if node == lastReal {
+		e.funcCtx.blockEndPos[blk.Index] = e.tokenCount - 1
+	}
+}
+
+// emitANN marshals the funcCtx into a JSON annotation line and writes it
+// directly to the output buffer (bypassing emit() so tokenCount is unaffected).
+func (e *emitter) emitANN() {
+	if e.funcCtx == nil {
+		return
+	}
+	ann := buildAnnotation(e.funcCtx)
+	if ann == nil {
+		return
+	}
+	b, err := json.Marshal(ann)
+	if err != nil {
+		return
+	}
+	e.w.WriteString("ANN ")
+	e.w.Write(b)
+	e.w.WriteByte('\n')
+}
+
 // walk is the core dispatch over AST node kinds.
 func (e *emitter) walk(n ast.Node) {
 	if n == nil {
 		return
+	}
+	if n.Pos().IsValid() {
+		e.currentPos = n.Pos()
 	}
 	switch v := n.(type) {
 
@@ -401,12 +746,19 @@ func (e *emitter) walk(n ast.Node) {
 		}
 		e.emit("CLOSE_COMPOSITE_LIT")
 	case *ast.FuncLit:
+		outerCtx := e.funcCtx
+		outerCount := e.tokenCount
+		e.tokenCount = 0
+		e.funcCtx = buildFuncCtx(cfg.New(v.Body, func(*ast.CallExpr) bool { return true }), v.Body)
 		e.emit("OPEN_FUNC_LIT")
 		e.enterScope()
 		e.walkFuncType(v.Type)
 		e.walk(v.Body)
 		e.exitScope()
 		e.emit("CLOSE_FUNC_LIT")
+		e.emitANN()
+		e.funcCtx = outerCtx
+		e.tokenCount = outerCount
 	case *ast.Ellipsis:
 		e.emit("OPEN_ELLIPSIS_TYPE")
 		e.walk(v.Elt)
@@ -444,7 +796,9 @@ func (e *emitter) walk(n ast.Node) {
 		e.emit("OPEN_BLOCK")
 		e.enterScope()
 		for _, s := range v.List {
+			e.cfgNodeBefore(s)
 			e.walk(s)
+			e.cfgNodeAfter(s)
 		}
 		e.exitScope()
 		e.emit("CLOSE_BLOCK")
@@ -490,9 +844,13 @@ func (e *emitter) walk(n ast.Node) {
 		e.emit("OPEN_IF")
 		e.enterScope()
 		if v.Init != nil {
+			e.cfgNodeBefore(v.Init)
 			e.walk(v.Init)
+			e.cfgNodeAfter(v.Init)
 		}
+		e.cfgNodeBefore(v.Cond)
 		e.walk(v.Cond)
+		e.cfgNodeAfter(v.Cond)
 		e.walk(v.Body)
 		if v.Else != nil {
 			e.emit("OPEN_ELSE")
@@ -505,13 +863,19 @@ func (e *emitter) walk(n ast.Node) {
 		e.emit("OPEN_FOR")
 		e.enterScope()
 		if v.Init != nil {
+			e.cfgNodeBefore(v.Init)
 			e.walk(v.Init)
+			e.cfgNodeAfter(v.Init)
 		}
 		if v.Cond != nil {
+			e.cfgNodeBefore(v.Cond)
 			e.walk(v.Cond)
+			e.cfgNodeAfter(v.Cond)
 		}
 		if v.Post != nil {
+			e.cfgNodeBefore(v.Post)
 			e.walk(v.Post)
+			e.cfgNodeAfter(v.Post)
 		}
 		e.walk(v.Body)
 		e.exitScope()
@@ -530,7 +894,9 @@ func (e *emitter) walk(n ast.Node) {
 			e.walk(v.Key)
 			e.walk(v.Value)
 		}
+		e.cfgNodeBefore(v.X)
 		e.walk(v.X)
+		e.cfgNodeAfter(v.X)
 		e.walk(v.Body)
 		e.exitScope()
 		e.emit("CLOSE_RANGE")
@@ -538,10 +904,14 @@ func (e *emitter) walk(n ast.Node) {
 		e.emit("OPEN_SWITCH")
 		e.enterScope()
 		if v.Init != nil {
+			e.cfgNodeBefore(v.Init)
 			e.walk(v.Init)
+			e.cfgNodeAfter(v.Init)
 		}
 		if v.Tag != nil {
+			e.cfgNodeBefore(v.Tag)
 			e.walk(v.Tag)
+			e.cfgNodeAfter(v.Tag)
 		}
 		e.walk(v.Body)
 		e.exitScope()
@@ -550,9 +920,13 @@ func (e *emitter) walk(n ast.Node) {
 		e.emit("OPEN_TYPE_SWITCH")
 		e.enterScope()
 		if v.Init != nil {
+			e.cfgNodeBefore(v.Init)
 			e.walk(v.Init)
+			e.cfgNodeAfter(v.Init)
 		}
+		e.cfgNodeBefore(v.Assign)
 		e.walk(v.Assign)
+		e.cfgNodeAfter(v.Assign)
 		e.walk(v.Body)
 		e.exitScope()
 		e.emit("CLOSE_TYPE_SWITCH")
@@ -563,7 +937,9 @@ func (e *emitter) walk(n ast.Node) {
 			e.walk(c)
 		}
 		for _, s := range v.Body {
+			e.cfgNodeBefore(s)
 			e.walk(s)
+			e.cfgNodeAfter(s)
 		}
 		e.exitScope()
 		e.emit("CLOSE_CASE")
@@ -577,10 +953,14 @@ func (e *emitter) walk(n ast.Node) {
 		e.emit("OPEN_COMM_CLAUSE")
 		e.enterScope()
 		if v.Comm != nil {
+			e.cfgNodeBefore(v.Comm)
 			e.walk(v.Comm)
+			e.cfgNodeAfter(v.Comm)
 		}
 		for _, s := range v.Body {
+			e.cfgNodeBefore(s)
 			e.walk(s)
+			e.cfgNodeAfter(s)
 		}
 		e.exitScope()
 		e.emit("CLOSE_COMM_CLAUSE")
@@ -617,6 +997,7 @@ func (e *emitter) walk(n ast.Node) {
 		e.emit(close)
 	case *ast.ValueSpec:
 		e.emit("OPEN_VALUE_SPEC")
+		e.cfgNodeBefore(v)
 		for _, n := range v.Names {
 			// package-level names were pre-registered; inner var/const in
 			// function bodies were not, so if not found, introduce fresh.
@@ -632,6 +1013,7 @@ func (e *emitter) walk(n ast.Node) {
 		for _, val := range v.Values {
 			e.walk(val)
 		}
+		e.cfgNodeAfter(v)
 		e.emit("CLOSE_VALUE_SPEC")
 	case *ast.TypeSpec:
 		e.emit("OPEN_TYPE_SPEC")
@@ -651,6 +1033,12 @@ func (e *emitter) walk(n ast.Node) {
 		e.emit("CLOSE_TYPE_SPEC")
 
 	case *ast.FuncDecl:
+		outerCtx := e.funcCtx
+		outerCount := e.tokenCount
+		e.tokenCount = 0
+		if v.Body != nil {
+			e.funcCtx = buildFuncCtx(cfg.New(v.Body, func(*ast.CallExpr) bool { return true }), v.Body)
+		}
 		e.emit("OPEN_FUNC_DECL")
 		e.enterScope()
 		if v.Recv != nil {
@@ -669,6 +1057,9 @@ func (e *emitter) walk(n ast.Node) {
 		}
 		e.exitScope()
 		e.emit("CLOSE_FUNC_DECL")
+		e.emitANN()
+		e.funcCtx = outerCtx
+		e.tokenCount = outerCount
 	}
 }
 
@@ -766,7 +1157,7 @@ func tokenizeFile(path string, w *bufio.Writer) error {
 	if err != nil {
 		return err
 	}
-	e := newEmitter(w)
+	e := newEmitter(w, fset)
 	e.emit("BOS")
 	e.enterScope() // package scope
 	e.collectPackageNames(file)
@@ -778,6 +1169,39 @@ func tokenizeFile(path string, w *bufio.Writer) error {
 	}
 	e.exitScope()
 	e.emit("EOF")
+
+	// Emit position map so downstream tools can map token indices to lines.
+	if len(e.tokenLines) > 0 {
+		b, _ := json.Marshal(e.tokenLines)
+		e.w.WriteString("POSMAP ")
+		e.w.Write(b)
+		e.w.WriteByte('\n')
+	}
+
+	// Emit package import short names so downstream tools can filter them out.
+	var importNames []string
+	for _, imp := range file.Imports {
+		if imp.Name != nil && imp.Name.Name != "." && imp.Name.Name != "_" {
+			importNames = append(importNames, imp.Name.Name)
+		} else {
+			importNames = append(importNames, extractImportName(imp.Path.Value))
+		}
+	}
+	if len(importNames) > 0 {
+		b, _ := json.Marshal(importNames)
+		e.w.WriteString("PKGS ")
+		e.w.Write(b)
+		e.w.WriteByte('\n')
+	}
+
+	// Emit NAMEPOSMAP so downstream tools can map each NAME_* token position
+	// back to its original identifier string (works across multiple functions).
+	if len(e.namePosMap) > 0 {
+		b, _ := json.Marshal(e.namePosMap)
+		e.w.WriteString("NAMEPOSMAP ")
+		e.w.Write(b)
+		e.w.WriteByte('\n')
+	}
 	return nil
 }
 

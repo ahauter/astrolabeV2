@@ -1,8 +1,16 @@
-"""Tokenize a directory of Go source files into a flat uint16 stream.
+"""Extract Go AST declaration units and persist them for live-mix training.
 
 Walks --src for `.go` files, hands them to the `ast-tokenize` Go helper in
-batches, maps each emitted token string through `vocab`, and appends the
-resulting IDs to `train.bin` / `val.bin` under --dst.
+batches, splits each file's token stream into individual top-level declaration
+units (functions, structs, type/var/const decls), and saves them as a flat
+uint16 binary + CSR offset index under --dst.
+
+ANN lines emitted by the helper after each function declaration are parsed and
+stored as a parallel JSONL file (train_ann.jsonl / val_ann.jsonl). Non-function
+units get a null line.
+
+The data iterator (CFGUnitMixDataset) assembles random permutations of units
+on-the-fly during training, giving effectively unlimited sample diversity.
 
 Usage:
     python -m astrolabe.prepare --src scraped_code --dst data --val-frac 0.05
@@ -10,62 +18,103 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import os
+import array
+import json
 import random
 import subprocess
 import sys
 from pathlib import Path
+from typing import Iterator
 
 import numpy as np
 
-from astrolabe.vocab import TOKEN_TO_ID, VOCAB_SIZE
+from astrolabe.vocab import TOKEN_TO_ID, VOCAB_SIZE, BOS_ID, EOF_ID
 
 
-# Path to the compiled helper, resolved relative to the repo root.
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_HELPER = REPO_ROOT / "ast-tokenize"
 
-
-def find_go_files(src: Path) -> list[Path]:
-    return sorted(p for p in src.rglob("*.go") if p.is_file())
+_LOW_QUALITY_PARTS = frozenset({"vendor", "_workspace"})
 
 
-def tokenize_batch(helper: Path, paths: list[Path]) -> list[list[int]]:
-    """Spawn the Go helper once for a batch of files; partition the flat
-    output stream by the BOS token so we get one id-list per file."""
+def _is_quality(path: Path) -> bool:
+    parts = set(path.parts)
+    if parts & _LOW_QUALITY_PARTS:
+        return False
+    if path.name.endswith(".pb.go"):
+        return False
+    return True
+
+
+def find_go_files(src: Path, quality_filter: bool = True) -> list[Path]:
+    files = (p for p in src.rglob("*.go") if p.is_file())
+    if quality_filter:
+        files = (p for p in files if _is_quality(p))
+    return sorted(files)
+
+
+def stream_units(
+    helper: Path, paths: list[Path]
+) -> Iterator[tuple[list[int], dict | None]]:
+    """Stream individual declaration units from the Go helper one at a time.
+
+    Spawns the helper once for the batch and reads its stdout line-by-line to
+    avoid buffering the entire output.  Yields (tokens, annotation) for each
+    EOF-delimited unit; annotation is None for non-function declarations.
+    """
     if not paths:
-        return []
-    proc = subprocess.run(
+        return
+    proc = subprocess.Popen(
         [str(helper), *[str(p) for p in paths]],
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        check=False,
     )
-    streams: list[list[int]] = []
-    current: list[int] | None = None
-    for line in proc.stdout.splitlines():
-        tok = line.strip()
-        if not tok:
+    assert proc.stdout is not None
+
+    current: list[int] = []
+    pending_ann: dict | None = None
+
+    for line in proc.stdout:
+        raw = line.strip()
+        if not raw:
             continue
-        tok_id = TOKEN_TO_ID.get(tok)
+
+        if raw.startswith("ANN "):
+            try:
+                pending_ann = json.loads(raw[4:])
+            except json.JSONDecodeError as exc:
+                print(f"warn: bad ANN JSON: {exc}", file=sys.stderr)
+                pending_ann = None
+            continue
+
+        tok_id = TOKEN_TO_ID.get(raw)
         if tok_id is None:
-            print(f"warn: unknown token {tok!r} from helper", file=sys.stderr)
+            print(f"warn: unknown token {raw!r} from helper", file=sys.stderr)
             continue
-        if tok == "BOS":
-            if current is not None:
-                streams.append(current)
-            current = [tok_id]
+
+        if raw == "BOS":
+            # Flush any incomplete unit at a file boundary
+            if current:
+                yield (current, None)
+                current = []
+                pending_ann = None
+        elif raw == "EOF":
+            if current:
+                yield (current, pending_ann)
+            current = []
+            pending_ann = None
         else:
-            if current is None:
-                # helper emitted something before BOS — skip
-                continue
             current.append(tok_id)
-    if current is not None:
-        streams.append(current)
-    if proc.returncode != 0 and not streams:
-        print(f"warn: helper exited {proc.returncode}: {proc.stderr[:200]}",
+
+    if current:
+        yield (current, None)
+
+    proc.wait()
+    if proc.returncode != 0:
+        stderr_out = proc.stderr.read(200)
+        print(f"warn: helper exited {proc.returncode}: {stderr_out}",
               file=sys.stderr)
-    return streams
 
 
 def main() -> None:
@@ -84,7 +133,9 @@ def main() -> None:
         sys.exit(f"ast-tokenize helper not found at {args.helper}; "
                  f"run `go build ./cmd/ast-tokenize` from the repo root")
 
+    assert VOCAB_SIZE < 2**16, f"vocab {VOCAB_SIZE} too large for uint16"
     args.dst.mkdir(parents=True, exist_ok=True)
+
     files = find_go_files(args.src)
     if not files:
         sys.exit(f"no .go files under {args.src}")
@@ -92,35 +143,47 @@ def main() -> None:
     rng = random.Random(args.seed)
     rng.shuffle(files)
 
-    train_path = args.dst / "train.bin"
-    val_path = args.dst / "val.bin"
-    # uint16 since vocab is small; assert that assumption holds.
-    assert VOCAB_SIZE < 2**16, f"vocab {VOCAB_SIZE} too large for uint16"
+    # array.array uses 8 bytes/entry vs ~28 for a Python list[int], saving
+    # ~440 MB at 23M units compared to the previous list approach.
+    train_offsets: array.array = array.array('Q', [0])
+    val_offsets:   array.array = array.array('Q', [0])
 
-    total = {"train": 0, "val": 0}
-    file_count = {"train": 0, "val": 0}
-    with open(train_path, "wb") as tf, open(val_path, "wb") as vf:
+    with open(args.dst / "train_units.bin",  "wb") as tf, \
+         open(args.dst / "val_units.bin",    "wb") as vf, \
+         open(args.dst / "train_ann.jsonl",  "w")  as ta, \
+         open(args.dst / "val_ann.jsonl",    "w")  as va:
         for i in range(0, len(files), args.batch):
             batch = files[i:i + args.batch]
-            streams = tokenize_batch(args.helper, batch)
-            for stream in streams:
-                if not stream:
+            for unit, ann in stream_units(args.helper, batch):
+                if not unit:
                     continue
-                split = "val" if rng.random() < args.val_frac else "train"
-                arr = np.asarray(stream, dtype=np.uint16)
-                sink = vf if split == "val" else tf
-                arr.tofile(sink)
-                total[split] += arr.size
-                file_count[split] += 1
+                arr = np.array(unit, dtype=np.uint16)
+                if rng.random() < args.val_frac:
+                    arr.tofile(vf)
+                    val_offsets.append(val_offsets[-1] + len(unit))
+                    va.write(json.dumps(ann) + "\n")
+                else:
+                    arr.tofile(tf)
+                    train_offsets.append(train_offsets[-1] + len(unit))
+                    ta.write(json.dumps(ann) + "\n")
             done = min(i + args.batch, len(files))
             print(f"  processed {done}/{len(files)} files  "
-                  f"train={total['train']} val={total['val']} tokens",
+                  f"train_units={len(train_offsets)-1} val_units={len(val_offsets)-1}",
                   flush=True)
 
-    print(f"\nwrote {train_path} ({total['train']} tokens, "
-          f"{file_count['train']} files)")
-    print(f"wrote {val_path} ({total['val']} tokens, "
-          f"{file_count['val']} files)")
+    np.save(args.dst / "train_units.idx.npy",
+            np.frombuffer(train_offsets, dtype=np.uint64))
+    np.save(args.dst / "val_units.idx.npy",
+            np.frombuffer(val_offsets,   dtype=np.uint64))
+
+    n_train = len(train_offsets) - 1
+    n_val   = len(val_offsets)   - 1
+    print(f"\nwrote {args.dst}/train_units.bin  "
+          f"({n_train} units, {train_offsets[-1]} tokens)")
+    print(f"wrote {args.dst}/val_units.bin    "
+          f"({n_val} units, {val_offsets[-1]} tokens)")
+    print(f"wrote {args.dst}/train_ann.jsonl  ({n_train} annotations)")
+    print(f"wrote {args.dst}/val_ann.jsonl    ({n_val} annotations)")
 
 
 if __name__ == "__main__":
