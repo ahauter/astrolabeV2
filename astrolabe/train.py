@@ -50,7 +50,7 @@ def evaluate(model: GPT, loader: DataLoader, device: str, iters: int) -> dict[st
         except StopIteration:
             break
         x, y, bb_l, du_p, edge_l, dom_p = _to(batch, device)
-        _, lm, bb, du, edge, dom = model(x, y, bb_l, du_p, edge_l, dom_p)
+        _, lm, bb, du, edge, dom, _, _ = model(x, y, bb_l, du_p, edge_l, dom_p)
         for name, val in (("lm", lm), ("bb", bb), ("du", du), ("edge", edge), ("dom", dom)):
             if val is not None:
                 totals[name] += val.item()
@@ -167,7 +167,7 @@ def main() -> None:
 
             x, y, bb_l, du_p, edge_l, dom_p = _to(batch, device)
             with torch.autocast(device_type=device, dtype=dtype, enabled=(device == "cuda")):
-                _, lm_loss, bb_loss, du_loss, edge_loss, dom_loss = model(
+                _, lm_loss, bb_loss, du_loss, edge_loss, dom_loss, _, _ = model(
                     x, y, bb_l, du_p, edge_l, dom_p
                 )
                 loss = lm_loss

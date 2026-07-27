@@ -5,17 +5,27 @@ __pycache__/
 venv
 
 scraped_code/
+scraped_code_remote/
 scrape_test/
+corpus_train/
+synth_eval/
 
 # build artifacts
 /ast-tokenize
 
 # pretraining outputs
 /data/
+/data_v2/
+/data_v3/
 /checkpoints/
 /checkpoints_risk/
 /checkpoints_risk_v2/
 /checkpoints_risk_v3/
+/checkpoints_risk_v4/
+/checkpoints_risk_v5/
+/checkpoints_risk_v6/
+/checkpoints_v2/
+/checkpoints_v3/
 
 # environment variables
 .env

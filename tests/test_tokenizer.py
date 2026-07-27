@@ -133,3 +133,28 @@ func F[T any](xs []T) (out []T) {
     toks = tokenize(src, tmp_path)
     missing = [t for t in toks if t not in TOKEN_TO_ID]
     assert not missing, f"tokens emitted but not in vocab: {set(missing)}"
+
+
+def test_type_tokens_emitted(tmp_path):
+    src = """package p
+func F(p *int, arr []int, i int, m map[string]int, s string, ch chan int) {
+    _ = *p
+    _ = arr[i]
+    _ = m["k"]
+    _ = s[i]
+    <-ch
+}
+"""
+    toks = tokenize(src, tmp_path)
+    # Each parameter should be followed by a TYPE_* token.
+    assert "TYPE_PTR" in toks
+    assert "TYPE_SLICE" in toks
+    assert "TYPE_BASIC" in toks
+    assert "TYPE_MAP" in toks
+    assert "TYPE_STRING" in toks
+    assert "TYPE_CHAN" in toks
+    # Spot-check relative ordering: parameter name followed by its type token.
+    ptr_idx = toks.index("TYPE_PTR")
+    assert toks[ptr_idx - 1].startswith("NAME_")
+    slice_idx = toks.index("TYPE_SLICE")
+    assert toks[slice_idx - 1].startswith("NAME_")

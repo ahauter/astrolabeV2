@@ -32,26 +32,6 @@ def get_token_names(data: np.memmap, start: int, end: int) -> list[str]:
     return [ID_TO_TOKEN[t] for t in data[start:end].tolist()]
 
 
-def _find_receiver_names(tokens: list[str]) -> set[str]:
-    """Collect NAME_N slots declared inside OPEN_RECV...CLOSE_RECV."""
-    receivers: set[str] = set()
-    for i, tok in enumerate(tokens):
-        if tok != "OPEN_RECV":
-            continue
-        depth = 1
-        j = i + 1
-        while j < len(tokens) and depth > 0:
-            t = tokens[j]
-            if t == "OPEN_RECV":
-                depth += 1
-            elif t == "CLOSE_RECV":
-                depth -= 1
-            if depth > 0 and t.startswith("NAME_") and t not in ("NAME_BLANK", "NAME_UNK"):
-                receivers.add(t)
-            j += 1
-    return receivers
-
-
 def _is_external_use(pos: int, use_set: set[int], du: dict[int, int], local_defs: set[int]) -> bool:
     """Return True if the token at position `pos` is a use of a name
     that is defined *outside* the current function (package import, global,
@@ -135,6 +115,24 @@ def _collect_bounds_guards(conditions: list[list[str]]) -> set[tuple[str, str]]:
     return guarded
 
 
+def _name_slot(name_tok: str) -> int | None:
+    """Return the integer slot of a NAME_N token, or None for special NAME_* tokens."""
+    if not name_tok.startswith("NAME_"):
+        return None
+    suffix = name_tok[len("NAME_"):]
+    if suffix.isdigit():
+        return int(suffix)
+    return None
+
+
+def _slot_type(name_tok: str, types_map: dict[str, str]) -> str:
+    """Return the coarse type category for a NAME_N token using the ANN types map."""
+    slot = _name_slot(name_tok)
+    if slot is None:
+        return "unknown"
+    return types_map.get(str(slot), "unknown")
+
+
 def find_nil_risks(tokens: list[str], ann: dict | None) -> list[int]:
     """Find token positions where a pointer/slice is dereferenced without
     a dominating nil check.
@@ -142,25 +140,28 @@ def find_nil_risks(tokens: list[str], ann: dict | None) -> list[int]:
     Patterns:
         OPEN_STAR   NAME_N          ← risky
         OPEN_SELECTOR NAME_N        ← risky
+
+    Only NAME_N slots whose coarse type is ptr or interface are considered risky.
     """
     risks: list[int] = []
     if ann is None:
         return risks
 
-    receivers = _find_receiver_names(tokens)
     use_set = set(ann.get("use", []))
     du = {int(k): v for k, v in ann.get("du", {}).items()}
     local_defs = set(ann.get("def", []))
     guarded = _collect_nil_guards(_extract_if_conditions(tokens))
+    types_map = ann.get("types", {})
+    risky_types = {"ptr", "interface"}
 
     for i, tok in enumerate(tokens):
         # Pattern A: OPEN_STAR followed by NAME_N
         if tok == "OPEN_STAR" and i + 1 < len(tokens):
             nxt = tokens[i + 1]
             if nxt.startswith("NAME_") and nxt not in ("NAME_BLANK", "NAME_UNK"):
-                if nxt in receivers:
-                    continue
                 if _is_external_use(i + 1, use_set, du, local_defs):
+                    continue
+                if _slot_type(nxt, types_map) not in risky_types:
                     continue
                 if nxt not in guarded:
                     risks.append(i + 1)
@@ -169,9 +170,9 @@ def find_nil_risks(tokens: list[str], ann: dict | None) -> list[int]:
         if tok == "OPEN_SELECTOR" and i + 1 < len(tokens):
             nxt = tokens[i + 1]
             if nxt.startswith("NAME_") and nxt not in ("NAME_BLANK", "NAME_UNK"):
-                if nxt in receivers:
-                    continue
                 if _is_external_use(i + 1, use_set, du, local_defs):
+                    continue
+                if _slot_type(nxt, types_map) not in risky_types:
                     continue
                 if nxt not in guarded:
                     risks.append(i + 1)
@@ -180,23 +181,26 @@ def find_nil_risks(tokens: list[str], ann: dict | None) -> list[int]:
 
 
 def find_bounds_risks(tokens: list[str], ann: dict | None) -> list[int]:
-    """Find token positions where an array/slice is indexed without a
+    """Find token positions where an array/slice/string is indexed without a
     dominating bounds check.
 
     Pattern:
         OPEN_INDEX
           NAME_A          ← array
           NAME_B          ← index variable ← we label THIS
+
+    Only NAME_A slots whose coarse type is slice, array, or string are considered risky.
     """
     risks: list[int] = []
     if ann is None:
         return risks
 
-    receivers = _find_receiver_names(tokens)
     use_set = set(ann.get("use", []))
     du = {int(k): v for k, v in ann.get("du", {}).items()}
     local_defs = set(ann.get("def", []))
     guarded = _collect_bounds_guards(_extract_if_conditions(tokens))
+    types_map = ann.get("types", {})
+    risky_types = {"slice", "array", "string"}
 
     for i, tok in enumerate(tokens):
         if tok != "OPEN_INDEX":
@@ -207,9 +211,9 @@ def find_bounds_risks(tokens: list[str], ann: dict | None) -> list[int]:
         idx_tok = tokens[i + 2]
         if not (arr_tok.startswith("NAME_") and idx_tok.startswith("NAME_")):
             continue
-        if arr_tok in receivers:
-            continue
         if _is_external_use(i + 1, use_set, du, local_defs):
+            continue
+        if _slot_type(arr_tok, types_map) not in risky_types:
             continue
         if (idx_tok, arr_tok) not in guarded:
             risks.append(i + 2)

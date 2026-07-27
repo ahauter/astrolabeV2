@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import array
 import json
+import os
 import random
 import subprocess
 import sys
@@ -47,9 +48,19 @@ def _is_quality(path: Path) -> bool:
 
 
 def find_go_files(src: Path, quality_filter: bool = True) -> list[Path]:
-    files = (p for p in src.rglob("*.go") if p.is_file())
-    if quality_filter:
-        files = (p for p in files if _is_quality(p))
+    # Use os.walk so directory symlinks are followed (useful for corpus
+    # directories that are assembled from multiple external trees).
+    files: list[Path] = []
+    for root, _, filenames in os.walk(src, followlinks=True):
+        for name in filenames:
+            if not name.endswith(".go"):
+                continue
+            p = Path(root) / name
+            if not p.is_file():
+                continue
+            if quality_filter and not _is_quality(p):
+                continue
+            files.append(p)
     return sorted(files)
 
 
@@ -86,6 +97,10 @@ def stream_units(
             except json.JSONDecodeError as exc:
                 print(f"warn: bad ANN JSON: {exc}", file=sys.stderr)
                 pending_ann = None
+            continue
+
+        # File-level metadata lines are not part of the token stream.
+        if raw.startswith(("POSMAP ", "PKGS ", "NAMEPOSMAP ")):
             continue
 
         tok_id = TOKEN_TO_ID.get(raw)

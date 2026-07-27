@@ -72,7 +72,7 @@ Identifiers are replaced with scoped indices rather than raw strings. The first 
 
 String and comment contents are dropped — pretraining is about **structure**, not lexical content.
 
-The resulting vocabulary is **329 tokens** (vs. 32k+ for standard BPE). That shrinks the embedding table, forces the model to learn bracket balancing and scoping from the token stream itself, and makes it cheap to check generation validity: any sample with mismatched open/close tokens is structurally invalid by definition.
+The resulting vocabulary is **341 tokens** (vs. 32k+ for standard BPE). That includes 12 coarse TYPE_* tokens emitted by `ast-tokenize` so the model can learn structural and type-aware patterns. That shrinks the embedding table, forces the model to learn bracket balancing and scoping from the token stream itself, and makes it cheap to check generation validity: any sample with mismatched open/close tokens is structurally invalid by definition.
 
 The Go→token converter lives in `cmd/ast-tokenize/`. Python code reads the stream through `astrolabe/vocab.py`, which is the single source of truth for the token table.
 

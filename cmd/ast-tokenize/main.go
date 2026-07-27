@@ -19,8 +19,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"go/ast"
+	"go/importer"
 	"go/parser"
 	"go/token"
+	"go/types"
 	"os"
 	"path"
 	"strconv"
@@ -51,6 +53,107 @@ var predeclared = map[string]string{
 	"error": "T_ERROR", "any": "T_ANY", "comparable": "T_COMPARABLE",
 }
 
+// typeCategory is a coarse, risk-relevant classification of a Go type.
+type typeCategory string
+
+const (
+	typePtr       typeCategory = "ptr"
+	typeSlice     typeCategory = "slice"
+	typeArray     typeCategory = "array"
+	typeMap       typeCategory = "map"
+	typeChan      typeCategory = "chan"
+	typeInterface typeCategory = "interface"
+	typeFunc      typeCategory = "func"
+	typeStruct    typeCategory = "struct"
+	typeBasic     typeCategory = "basic"
+	typeString    typeCategory = "string"
+	typeUnknown   typeCategory = "unknown"
+	typeLabel     typeCategory = "label"
+)
+
+// typeCategoryOf maps a go/types.Type to a coarse category.
+// It also accepts a types.Object so that labels can be classified.
+func typeCategoryOf(typ types.Type) typeCategory {
+	if typ == nil {
+		return typeUnknown
+	}
+	switch t := typ.Underlying().(type) {
+	case *types.Pointer:
+		return typePtr
+	case *types.Slice:
+		return typeSlice
+	case *types.Array:
+		return typeArray
+	case *types.Map:
+		return typeMap
+	case *types.Chan:
+		return typeChan
+	case *types.Interface:
+		return typeInterface
+	case *types.Signature:
+		return typeFunc
+	case *types.Struct:
+		return typeStruct
+	case *types.Basic:
+		if t.Kind() == types.String || t.Kind() == types.UntypedString {
+			return typeString
+		}
+		return typeBasic
+	}
+	return typeUnknown
+}
+
+// typeCategoryOfObject maps a go/types.Object to a coarse category.
+func typeCategoryOfObject(obj types.Object) typeCategory {
+	if obj == nil {
+		return typeUnknown
+	}
+	if _, ok := obj.(*types.Label); ok {
+		return typeLabel
+	}
+	return typeCategoryOf(obj.Type())
+}
+
+// typeCategoryFromExpr infers a coarse type category from an AST type expression.
+// Used as a fallback when go/types type-checking is unavailable or fails.
+func typeCategoryFromExpr(expr ast.Expr) typeCategory {
+	switch e := expr.(type) {
+	case *ast.StarExpr:
+		return typePtr
+	case *ast.ArrayType:
+		if e.Len == nil {
+			return typeSlice
+		}
+		return typeArray
+	case *ast.MapType:
+		return typeMap
+	case *ast.ChanType:
+		return typeChan
+	case *ast.InterfaceType:
+		return typeInterface
+	case *ast.FuncType:
+		return typeFunc
+	case *ast.StructType:
+		return typeStruct
+	case *ast.Ident:
+		// Recognize a few common type identifiers without type-checking.
+		switch e.Name {
+		case "string":
+			return typeString
+		case "int", "int8", "int16", "int32", "int64",
+			"uint", "uint8", "uint16", "uint32", "uint64", "uintptr",
+			"float32", "float64", "complex64", "complex128",
+			"bool", "byte", "rune":
+			return typeBasic
+		}
+	case *ast.SelectorExpr:
+		// e.g. bytes.Buffer, time.Time — value/named type; without full
+		// type info we cannot distinguish pointer vs value, so leave unknown.
+		return typeUnknown
+	}
+	return typeUnknown
+}
+
 // nameEvent records a single identifier definition or use within a function.
 type nameEvent struct {
 	pos  int    // token position from declaration start (0-indexed)
@@ -61,14 +164,15 @@ type nameEvent struct {
 
 // funcCtx holds per-function CFG data accumulated during the walk of a function declaration.
 type funcCtx struct {
-	nodeToBlock        map[ast.Node]*cfg.Block // real body AST node → its CFG block
-	rpoOrder           []*cfg.Block            // blocks in reverse post-order
-	rpoIndex           map[int32]int           // block.Index → RPO position
-	preds              map[int32][]*cfg.Block  // block.Index → predecessor blocks
-	blockStartPos      map[int32]int           // block.Index → first token position in declaration
-	blockEndPos        map[int32]int           // block.Index → last token position in declaration
+	nodeToBlock        map[ast.Node]*cfg.Block      // real body AST node → its CFG block
+	rpoOrder           []*cfg.Block                 // blocks in reverse post-order
+	rpoIndex           map[int32]int                // block.Index → RPO position
+	preds              map[int32][]*cfg.Block       // block.Index → predecessor blocks
+	blockStartPos      map[int32]int                // block.Index → first token position in declaration
+	blockEndPos        map[int32]int                // block.Index → last token position in declaration
 	blockStartRecorded map[int32]bool
 	nameEvents         []nameEvent
+	slotTypes          map[int]typeCategory         // NAME_N slot → coarse type category
 }
 
 // cfgAnnotation is the JSON object emitted on "ANN {...}" lines after each function.
@@ -79,6 +183,7 @@ type cfgAnnotation struct {
 	DU    map[string]int               `json:"du,omitempty"`
 	Edges map[string]map[string]string `json:"edges,omitempty"`
 	IDom  map[string]int               `json:"idom,omitempty"`
+	Types map[string]string            `json:"types,omitempty"`
 }
 
 type emitter struct {
@@ -86,17 +191,18 @@ type emitter struct {
 	nameStack       []string
 	scopeMarks      []int
 	fields          map[string]int
-	funcCtx         *funcCtx // non-nil only inside a function declaration
-	tokenCount      int      // tokens emitted from declaration start (valid when funcCtx != nil)
+	funcCtx         *funcCtx    // non-nil only inside a function declaration
+	tokenCount      int         // tokens emitted from declaration start (valid when funcCtx != nil)
 	fset            *token.FileSet
 	currentPos      token.Pos
 	globalTokCount  int
 	tokenLines      []int
 	namePosMap      map[int]string // global token index -> original identifier (for NAME_* tokens only)
+	typeInfo        *types.Info // nil if type-checking failed or was not performed
 }
 
-func newEmitter(w *bufio.Writer, fset *token.FileSet) *emitter {
-	return &emitter{w: w, fields: map[string]int{}, fset: fset, namePosMap: map[int]string{}}
+func newEmitter(w *bufio.Writer, fset *token.FileSet, typeInfo *types.Info) *emitter {
+	return &emitter{w: w, fields: map[string]int{}, fset: fset, namePosMap: map[int]string{}, typeInfo: typeInfo}
 }
 
 func (e *emitter) emit(tok string) {
@@ -124,12 +230,14 @@ func (e *emitter) exitScope() {
 	e.nameStack = e.nameStack[:mark]
 }
 
-// introduce registers name in the innermost scope and emits its token.
-func (e *emitter) introduce(name string) {
-	if name == "_" {
+// introduce registers the identifier in the innermost scope, emits its token,
+// and emits a coarse TYPE_* token immediately after.
+func (e *emitter) introduce(id *ast.Ident, fallbackExpr ...ast.Expr) {
+	if id == nil || id.Name == "_" {
 		e.emit("NAME_BLANK")
 		return
 	}
+	name := id.Name
 	e.nameStack = append(e.nameStack, name)
 	idx := len(e.nameStack) - 1
 	if idx >= nameSlots {
@@ -144,6 +252,32 @@ func (e *emitter) introduce(name string) {
 	if e.funcCtx != nil {
 		e.funcCtx.nameEvents = append(e.funcCtx.nameEvents, nameEvent{e.tokenCount - 1, "def", idx, name})
 	}
+
+	// Emit type token and record slot type.
+	cat := e.typeCategoryOfIdent(id)
+	if cat == typeUnknown && len(fallbackExpr) > 0 {
+		cat = typeCategoryFromExpr(fallbackExpr[0])
+	}
+	e.emit("TYPE_" + strings.ToUpper(string(cat)))
+	if e.funcCtx != nil && idx < nameSlots {
+		if e.funcCtx.slotTypes == nil {
+			e.funcCtx.slotTypes = make(map[int]typeCategory)
+		}
+		e.funcCtx.slotTypes[idx] = cat
+	}
+}
+
+// typeCategoryOfIdent resolves the coarse type category of an identifier definition
+// using go/types when available, otherwise returns unknown.
+func (e *emitter) typeCategoryOfIdent(id *ast.Ident) typeCategory {
+	if e.typeInfo == nil {
+		return typeUnknown
+	}
+	obj := e.typeInfo.Defs[id]
+	if obj == nil {
+		return typeUnknown
+	}
+	return typeCategoryOfObject(obj)
 }
 
 // register adds name to the innermost scope without emitting. Used during the
@@ -363,7 +497,7 @@ func (e *emitter) walkFieldList(fl *ast.FieldList, mode fieldMode) {
 		for _, n := range f.Names {
 			switch mode {
 			case introduceNames:
-				e.introduce(n.Name)
+				e.introduce(n, f.Type)
 			case fieldNames:
 				e.field(n.Name)
 			default:
@@ -454,6 +588,7 @@ func buildFuncCtx(g *cfg.CFG, body *ast.BlockStmt) *funcCtx {
 		blockStartPos:      make(map[int32]int),
 		blockEndPos:        make(map[int32]int),
 		blockStartRecorded: make(map[int32]bool),
+		slotTypes:          make(map[int]typeCategory),
 	}
 }
 
@@ -596,6 +731,14 @@ func buildAnnotation(ctx *funcCtx) *cfgAnnotation {
 	idom := computeDominance(ctx.rpoOrder, ctx.rpoIndex, ctx.preds)
 	for blockIdx, domIdx := range idom {
 		ann.IDom[strconv.Itoa(int(blockIdx))] = int(domIdx)
+	}
+
+	// Types: coarse category for each NAME_N slot introduced in the function.
+	if len(ctx.slotTypes) > 0 {
+		ann.Types = make(map[string]string)
+		for slot, cat := range ctx.slotTypes {
+			ann.Types[strconv.Itoa(slot)] = string(cat)
+		}
 	}
 
 	return ann
@@ -811,7 +954,7 @@ func (e *emitter) walk(n ast.Node) {
 		for _, lhs := range v.Lhs {
 			if v.Tok == token.DEFINE {
 				if id, ok := lhs.(*ast.Ident); ok {
-					e.introduce(id.Name)
+					e.introduce(id)
 					continue
 				}
 			}
@@ -885,10 +1028,10 @@ func (e *emitter) walk(n ast.Node) {
 		e.enterScope()
 		if v.Tok == token.DEFINE {
 			if id, ok := v.Key.(*ast.Ident); ok && id != nil {
-				e.introduce(id.Name)
+				e.introduce(id)
 			}
 			if id, ok := v.Value.(*ast.Ident); ok && id != nil {
-				e.introduce(id.Name)
+				e.introduce(id)
 			}
 		} else {
 			e.walk(v.Key)
@@ -979,7 +1122,7 @@ func (e *emitter) walk(n ast.Node) {
 		e.emit("CLOSE_SEND")
 	case *ast.LabeledStmt:
 		e.emit("OPEN_LABELED")
-		e.introduce(v.Label.Name)
+		e.introduce(v.Label)
 		e.walk(v.Stmt)
 		e.emit("CLOSE_LABELED")
 	case *ast.EmptyStmt:
@@ -1002,7 +1145,7 @@ func (e *emitter) walk(n ast.Node) {
 			// package-level names were pre-registered; inner var/const in
 			// function bodies were not, so if not found, introduce fresh.
 			if !e.nameInStack(n.Name) {
-				e.introduce(n.Name)
+				e.introduce(n, v.Type)
 			} else {
 				e.reference(n.Name)
 			}
@@ -1018,7 +1161,7 @@ func (e *emitter) walk(n ast.Node) {
 	case *ast.TypeSpec:
 		e.emit("OPEN_TYPE_SPEC")
 		if !e.nameInStack(v.Name.Name) {
-			e.introduce(v.Name.Name)
+			e.introduce(v.Name, v.Type)
 		} else {
 			e.reference(v.Name.Name)
 		}
@@ -1147,6 +1290,26 @@ func (e *emitter) collectPackageNames(file *ast.File) {
 	}
 }
 
+// typeCheckFile attempts to type-check a single file as its own package.
+// It returns the partially populated types.Info even when type-checking
+// reports errors (e.g., unused variables), because the type info is still
+// useful for the coarse type categories we emit.
+func typeCheckFile(fset *token.FileSet, file *ast.File) *types.Info {
+	pkg := types.NewPackage(file.Name.Name, file.Name.Name)
+	info := &types.Info{
+		Types: make(map[ast.Expr]types.TypeAndValue),
+		Defs:  make(map[*ast.Ident]types.Object),
+		Uses:  make(map[*ast.Ident]types.Object),
+	}
+	conf := types.Config{
+		Importer:    importer.Default(),
+		Error:       func(err error) { /* ignore type errors; partial info is still useful */ },
+		FakeImportC: true,
+	}
+	conf.Check(pkg.Path(), fset, []*ast.File{file}, info)
+	return info
+}
+
 func tokenizeFile(path string, w *bufio.Writer) error {
 	fset := token.NewFileSet()
 	src, err := os.ReadFile(path)
@@ -1157,7 +1320,8 @@ func tokenizeFile(path string, w *bufio.Writer) error {
 	if err != nil {
 		return err
 	}
-	e := newEmitter(w, fset)
+	typeInfo := typeCheckFile(fset, file)
+	e := newEmitter(w, fset, typeInfo)
 	e.emit("BOS")
 	e.enterScope() // package scope
 	e.collectPackageNames(file)
