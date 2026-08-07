@@ -71,23 +71,6 @@ _ATOMS = [
 ]
 
 
-# Coarse type categories emitted by ast-tokenize after each NAME_N introduction.
-_TYPE_TOKENS = [
-    "TYPE_PTR",
-    "TYPE_SLICE",
-    "TYPE_ARRAY",
-    "TYPE_MAP",
-    "TYPE_CHAN",
-    "TYPE_INTERFACE",
-    "TYPE_FUNC",
-    "TYPE_STRUCT",
-    "TYPE_BASIC",
-    "TYPE_STRING",
-    "TYPE_UNKNOWN",
-    "TYPE_LABEL",
-]
-
-
 def _build_vocab() -> tuple[list[str], dict[str, int]]:
     tokens: list[str] = []
     tokens += _ATOMS
@@ -98,7 +81,6 @@ def _build_vocab() -> tuple[list[str], dict[str, int]]:
         tokens.append(f"NAME_{i}")
     for i in range(FIELD_SLOTS):
         tokens.append(f"FIELD_{i}")
-    tokens += _TYPE_TOKENS
     if len(set(tokens)) != len(tokens):
         dupes = [t for t in tokens if tokens.count(t) > 1]
         raise RuntimeError(f"duplicate vocab entries: {set(dupes)}")

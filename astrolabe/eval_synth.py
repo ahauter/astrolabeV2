@@ -80,6 +80,7 @@ def main() -> None:
     kind_stats: dict[str, dict[str, int]] = {
         "nil": {"tp": 0, "fp": 0, "fn": 0},
         "bounds": {"tp": 0, "fp": 0, "fn": 0},
+        "race": {"tp": 0, "fp": 0, "fn": 0},
     }
     per_sample: list[dict] = []
 

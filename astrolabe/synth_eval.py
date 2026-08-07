@@ -70,6 +70,27 @@ BOUNDS_TEMPLATES = [
     ("func {func_name}(matrix [][]int, row, col int) int", "return matrix[row][col]", [], "{func_name}([][]int{{{{1,2}}}}, 10, 0)"),
 ]
 
+RACE_TEMPLATES = [
+    ("func {func_name}(m map[string]int) int", "m[\"x\"]++; return 0", [], """m := map[string]int{{}}
+var wg sync.WaitGroup
+wg.Add(1)
+go func() {{ defer wg.Done(); {func_name}(m) }}()
+{func_name}(m)
+wg.Wait()"""),
+    ("func {func_name}(s *[]int) int", "*s = append(*s, 1); return 0", [], """s := make([]int, 0)
+var wg sync.WaitGroup
+wg.Add(1)
+go func() {{ defer wg.Done(); {func_name}(&s) }}()
+{func_name}(&s)
+wg.Wait()"""),
+    ("func {func_name}(n *int) int", "*n++; return 0", [], """n := 0
+var wg sync.WaitGroup
+wg.Add(1)
+go func() {{ defer wg.Done(); {func_name}(&n) }}()
+{func_name}(&n)
+wg.Wait()"""),
+]
+
 
 # ---------------------------------------------------------------------------
 # llama-server management
@@ -198,9 +219,19 @@ def extract_function_body(code: str, func_name: str) -> str | None:
 def body_is_valid(body: str, kind: str) -> bool:
     """Reject bodies that are empty or contain forbidden safety checks."""
     body = body.strip()
+    lowered = body.lower()
+    if kind == "race":
+        # Race bodies perform an unsynchronized write to a shared variable.
+        if not ("++" in body or "append" in lowered or "[" in body):
+            return False
+        forbidden = {"sync.", "atomic", "make(chan", "mutex", "rwmutex"}
+        for tok in forbidden:
+            if tok in lowered:
+                return False
+        return True
+
     if not body.startswith("return"):
         return False
-    lowered = body.lower()
     forbidden = {"if", "for", "len", "recover", "==", "!=", "<", ">", "<=", ">="}
     for tok in forbidden:
         if tok in lowered:
@@ -212,11 +243,21 @@ def body_is_valid(body: str, kind: str) -> bool:
     return True
 
 
-def build_program(signature: str, func_name: str, body: str, structs: list[str], main_call: str) -> str:
+def build_program(
+    signature: str,
+    func_name: str,
+    body: str,
+    structs: list[str],
+    main_call: str,
+    imports: list[str] | None = None,
+) -> str:
     structs_block = ("\n\n".join(structs) + "\n\n") if structs else ""
+    import_block = ""
+    if imports:
+        import_block = "import (\n    " + "\n    ".join(f'"{imp}"' for imp in imports) + "\n)\n\n"
     return f"""package main
 
-{structs_block}{signature} {{
+{import_block}{structs_block}{signature} {{
     {body}
 }}
 
@@ -230,9 +271,14 @@ func main() {{
 # Program execution
 # ---------------------------------------------------------------------------
 
-def run_program(go_file: Path, timeout: int = 10) -> tuple[int, str, str]:
+def run_program(go_file: Path, timeout: int = 10, race: bool = False) -> tuple[int, str, str]:
+    cmd = ["go", "run"]
+    if race:
+        cmd.append("-race")
+    # Run from the file's directory and refer to the file by name so relative
+    # paths resolve correctly.
     proc = subprocess.run(
-        ["go", "run", str(go_file)],
+        cmd + [go_file.name],
         cwd=go_file.parent,
         capture_output=True,
         text=True,
@@ -242,6 +288,8 @@ def run_program(go_file: Path, timeout: int = 10) -> tuple[int, str, str]:
 
 
 def classify_panic(stderr: str) -> str | None:
+    if "WARNING: DATA RACE" in stderr:
+        return "race"
     if "invalid memory address or nil pointer dereference" in stderr:
         return "nil"
     if "index out of range" in stderr or "slice bounds out of range" in stderr:
@@ -294,13 +342,17 @@ def find_risk_token_position(tokens: list[str], pos_map: list[int], panic_line: 
                 nxt = tokens[i + 1]
                 if nxt.startswith("NAME_") and nxt not in ("NAME_BLANK", "NAME_UNK"):
                     return i + 1
-    else:  # bounds
+    elif kind == "bounds":
         for i in indices:
             if tokens[i] == "OPEN_INDEX":
                 if i + 2 < len(tokens):
                     idx_tok = tokens[i + 2]
                     if idx_tok.startswith("NAME_") and idx_tok not in ("NAME_BLANK", "NAME_UNK"):
                         return i + 2
+    else:  # race
+        for i in indices:
+            if tokens[i].startswith("NAME_") and tokens[i] not in ("NAME_BLANK", "NAME_UNK"):
+                return i
     for i in indices:
         if tokens[i].startswith("NAME_") and tokens[i] not in ("NAME_BLANK", "NAME_UNK"):
             return i
@@ -319,17 +371,27 @@ def generate_one(
     temperature: float = 0.7,
     max_retries: int = 5,
 ) -> dict[str, Any] | None:
-    templates = NIL_TEMPLATES if kind == "nil" else BOUNDS_TEMPLATES
+    if kind == "nil":
+        templates = NIL_TEMPLATES
+    elif kind == "bounds":
+        templates = BOUNDS_TEMPLATES
+    else:
+        templates = RACE_TEMPLATES
     signature_template, behavior, structs, main_call_template = random.choice(templates)
     func_name = f"Risk{kind.capitalize()}{idx:04d}"
     signature = signature_template.format(func_name=func_name)
     main_call = main_call_template.format(func_name=func_name)
 
+    kind_desc = {
+        "nil": "nil pointer dereference",
+        "bounds": "index out of range",
+        "race": "data race",
+    }[kind]
     prompt = PROGRAM_PROMPT.format(
         func_name=func_name,
         signature=signature,
         behavior=behavior,
-        kind="nil pointer dereference" if kind == "nil" else "index out of range",
+        kind=kind_desc,
     )
 
     work_dir = out_dir / f"{kind}_{idx:04d}"
@@ -358,19 +420,23 @@ def generate_one(
             (work_dir / f"attempt_{attempt}_raw.go").write_text(code)
             continue
 
-        # Rebuild with our own guaranteed-panic harness.
-        code = build_program(signature, func_name, body, structs, main_call)
+        # Rebuild with our own guaranteed-panic/race harness.
+        imports = ["sync"] if kind == "race" else None
+        code = build_program(signature, func_name, body, structs, main_call, imports=imports)
         generated_path = work_dir / "generated.go"
         generated_path.write_text(code)
 
         try:
-            rc, stdout, stderr = run_program(generated_path)
+            rc, stdout, stderr = run_program(generated_path, race=(kind == "race"))
         except subprocess.TimeoutExpired:
             print(f"  {func_name} attempt {attempt+1}: execution timed out")
             continue
 
-        if rc == 0:
+        if rc == 0 and kind != "race":
             print(f"  {func_name} attempt {attempt+1}: no panic (safe)")
+            continue
+        if rc == 0 and kind == "race":
+            print(f"  {func_name} attempt {attempt+1}: no race detected")
             continue
 
         panic_kind = classify_panic(stderr)
@@ -427,6 +493,7 @@ def main() -> None:
     p.add_argument("--out-dir", type=Path, default=Path("synth_eval"))
     p.add_argument("--count-nil", type=int, default=100)
     p.add_argument("--count-bounds", type=int, default=100)
+    p.add_argument("--count-race", type=int, default=0)
     p.add_argument("--llama-model", default="unsloth/LFM2.5-8B-A1B-GGUF:UD-Q4_K_M")
     p.add_argument("--llama-port", type=int, default=LLAMA_PORT)
     p.add_argument("--helper", type=Path, default=DEFAULT_HELPER)
@@ -452,14 +519,14 @@ def main() -> None:
     LLAMA_URL = f"http://127.0.0.1:{args.llama_port}/v1/chat/completions"
 
     labels: list[dict[str, Any]] = []
-    counters: dict[str, int] = {"nil": 0, "bounds": 0}
-    target = {"nil": args.count_nil, "bounds": args.count_bounds}
+    counters: dict[str, int] = {"nil": 0, "bounds": 0, "race": 0}
+    target = {"nil": args.count_nil, "bounds": args.count_bounds, "race": args.count_race}
     total_attempts = 0
 
-    kinds = ["nil"] * args.count_nil + ["bounds"] * args.count_bounds
+    kinds = ["nil"] * args.count_nil + ["bounds"] * args.count_bounds + ["race"] * args.count_race
     random.shuffle(kinds)
 
-    idx = {"nil": 0, "bounds": 0}
+    idx = {"nil": 0, "bounds": 0, "race": 0}
     for kind in kinds:
         if counters[kind] >= target[kind]:
             continue
@@ -487,7 +554,7 @@ def main() -> None:
         for label in labels:
             f.write(json.dumps(label) + "\n")
 
-    print(f"\nGenerated {len(labels)} labels ({counters['nil']} nil, {counters['bounds']} bounds)")
+    print(f"\nGenerated {len(labels)} labels ({counters['nil']} nil, {counters['bounds']} bounds, {counters['race']} race)")
     print(f"Saved to {labels_path}")
 
     if not args.no_start_server:

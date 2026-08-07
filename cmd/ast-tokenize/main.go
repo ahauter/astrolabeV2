@@ -17,6 +17,7 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"runtime/debug"
 	"fmt"
 	"go/ast"
 	"go/importer"
@@ -164,6 +165,7 @@ type nameEvent struct {
 
 // funcCtx holds per-function CFG data accumulated during the walk of a function declaration.
 type funcCtx struct {
+	funcName           string
 	nodeToBlock        map[ast.Node]*cfg.Block      // real body AST node → its CFG block
 	rpoOrder           []*cfg.Block                 // blocks in reverse post-order
 	rpoIndex           map[int32]int                // block.Index → RPO position
@@ -173,17 +175,35 @@ type funcCtx struct {
 	blockStartRecorded map[int32]bool
 	nameEvents         []nameEvent
 	slotTypes          map[int]typeCategory         // NAME_N slot → coarse type category
+	syncEvents         []syncEvent
+	goSpawns           []int
+	packageSlots       int                          // number of package-level names in nameStack when function started
+	recvSlot           int                          // NAME slot of the method receiver, -1 if none
+	importSlots        map[int]struct{}             // slots that are import aliases (excluded from shared set)
+}
+
+// syncEvent records a synchronization call inside a function body.
+type syncEvent struct {
+	Start      int    `json:"start"`
+	End        int    `json:"end"`
+	Kind       string `json:"kind"`
+	RecvSlot   int    `json:"recv"`
+	Method     string `json:"method"`
 }
 
 // cfgAnnotation is the JSON object emitted on "ANN {...}" lines after each function.
 type cfgAnnotation struct {
-	BB    []int                        `json:"bb"`
-	Def   []int                        `json:"def,omitempty"`
-	Use   []int                        `json:"use,omitempty"`
-	DU    map[string]int               `json:"du,omitempty"`
-	Edges map[string]map[string]string `json:"edges,omitempty"`
-	IDom  map[string]int               `json:"idom,omitempty"`
-	Types map[string]string            `json:"types,omitempty"`
+	Func   string                       `json:"func,omitempty"`
+	BB     []int                        `json:"bb"`
+	Def    []int                        `json:"def,omitempty"`
+	Use    []int                        `json:"use,omitempty"`
+	Shared []int                        `json:"shared,omitempty"`
+	DU     map[string]int               `json:"du,omitempty"`
+	Edges  map[string]map[string]string `json:"edges,omitempty"`
+	IDom   map[string]int               `json:"idom,omitempty"`
+	Types  map[string]string            `json:"types,omitempty"`
+	Sync   []syncEvent                  `json:"sync,omitempty"`
+	Go     []int                        `json:"go,omitempty"`
 }
 
 type emitter struct {
@@ -199,10 +219,13 @@ type emitter struct {
 	tokenLines      []int
 	namePosMap      map[int]string // global token index -> original identifier (for NAME_* tokens only)
 	typeInfo        *types.Info // nil if type-checking failed or was not performed
+	pkgName         string
+	atomicPkgs      map[string]bool // local import names that refer to sync/atomic
+	importSlots     map[int]struct{} // NAME slots that are import aliases (excluded from shared set)
 }
 
-func newEmitter(w *bufio.Writer, fset *token.FileSet, typeInfo *types.Info) *emitter {
-	return &emitter{w: w, fields: map[string]int{}, fset: fset, namePosMap: map[int]string{}, typeInfo: typeInfo}
+func newEmitter(w *bufio.Writer, fset *token.FileSet, typeInfo *types.Info, pkgName string) *emitter {
+	return &emitter{w: w, fields: map[string]int{}, fset: fset, namePosMap: map[int]string{}, typeInfo: typeInfo, pkgName: pkgName, atomicPkgs: map[string]bool{}, importSlots: map[int]struct{}{}}
 }
 
 func (e *emitter) emit(tok string) {
@@ -253,18 +276,88 @@ func (e *emitter) introduce(id *ast.Ident, fallbackExpr ...ast.Expr) {
 		e.funcCtx.nameEvents = append(e.funcCtx.nameEvents, nameEvent{e.tokenCount - 1, "def", idx, name})
 	}
 
-	// Emit type token and record slot type.
+	// Record coarse type category for risk analysis (not emitted as a token).
 	cat := e.typeCategoryOfIdent(id)
 	if cat == typeUnknown && len(fallbackExpr) > 0 {
 		cat = typeCategoryFromExpr(fallbackExpr[0])
 	}
-	e.emit("TYPE_" + strings.ToUpper(string(cat)))
 	if e.funcCtx != nil && idx < nameSlots {
 		if e.funcCtx.slotTypes == nil {
 			e.funcCtx.slotTypes = make(map[int]typeCategory)
 		}
 		e.funcCtx.slotTypes[idx] = cat
 	}
+}
+
+// syncMethodKind returns the synchronization kind for common sync primitive
+// method names, or "" if the method is not a tracked synchronization call.
+func syncMethodKind(name string) string {
+	switch name {
+	case "Lock":
+		return "lock"
+	case "Unlock":
+		return "unlock"
+	case "RLock":
+		return "rlock"
+	case "RUnlock":
+		return "runlock"
+	case "Add", "Done":
+		return "wg_" + strings.ToLower(name)
+	case "Wait":
+		return "wait"
+	case "Signal":
+		return "cond_signal"
+	case "Broadcast":
+		return "cond_broadcast"
+	}
+	return ""
+}
+
+// slotOfName returns the current NAME_N slot for name in the active scope chain,
+// or -1 if the name is not bound or overflows the slot limit.
+func (e *emitter) slotOfName(name string) int {
+	if name == "_" {
+		return -1
+	}
+	for i := len(e.nameStack) - 1; i >= 0; i-- {
+		if e.nameStack[i] == name {
+			if i >= nameSlots {
+				return -1
+			}
+			return i
+		}
+	}
+	return -1
+}
+
+// recvTypeString returns a short string representation of a receiver type for
+// function identity metadata.
+func recvTypeString(expr ast.Expr) string {
+	switch t := expr.(type) {
+	case *ast.Ident:
+		return t.Name
+	case *ast.StarExpr:
+		return "*" + recvTypeString(t.X)
+	case *ast.SelectorExpr:
+		return recvTypeString(t.X) + "." + t.Sel.Name
+	case *ast.ArrayType:
+		return "[]" + recvTypeString(t.Elt)
+	}
+	return "?"
+}
+
+// leftmostIdent returns the leftmost identifier in a selector expression chain,
+// e.g. "c.mu" -> "c". Returns nil if the expression is not a name chain.
+func leftmostIdent(expr ast.Expr) *ast.Ident {
+	switch e := expr.(type) {
+	case *ast.Ident:
+		return e
+	case *ast.SelectorExpr:
+		return leftmostIdent(e.X)
+	case *ast.StarExpr:
+		return leftmostIdent(e.X)
+	}
+	return nil
 }
 
 // typeCategoryOfIdent resolves the coarse type category of an identifier definition
@@ -282,11 +375,14 @@ func (e *emitter) typeCategoryOfIdent(id *ast.Ident) typeCategory {
 
 // register adds name to the innermost scope without emitting. Used during the
 // package-scope pre-pass so later references can resolve to a NAME slot.
-func (e *emitter) register(name string) {
+// Returns the NAME slot assigned, or -1 if the name was skipped.
+func (e *emitter) register(name string) int {
 	if name == "" || name == "_" {
-		return
+		return -1
 	}
+	idx := len(e.nameStack)
 	e.nameStack = append(e.nameStack, name)
+	return idx
 }
 
 // nameInStack reports whether name is currently bound in any active scope.
@@ -589,6 +685,9 @@ func buildFuncCtx(g *cfg.CFG, body *ast.BlockStmt) *funcCtx {
 		blockEndPos:        make(map[int32]int),
 		blockStartRecorded: make(map[int32]bool),
 		slotTypes:          make(map[int]typeCategory),
+		syncEvents:         []syncEvent{},
+		goSpawns:           []int{},
+		recvSlot:           -1,
 	}
 }
 
@@ -654,9 +753,12 @@ func buildAnnotation(ctx *funcCtx) *cfgAnnotation {
 		return nil
 	}
 	ann := &cfgAnnotation{
+		Func:  ctx.funcName,
 		DU:    make(map[string]int),
 		Edges: make(map[string]map[string]string),
 		IDom:  make(map[string]int),
+		Sync:  ctx.syncEvents,
+		Go:    ctx.goSpawns,
 	}
 
 	// BB: block start positions in RPO order.
@@ -675,6 +777,35 @@ func buildAnnotation(ctx *funcCtx) *cfgAnnotation {
 			ann.Def = append(ann.Def, ev.pos)
 		} else {
 			ann.Use = append(ann.Use, ev.pos)
+		}
+	}
+
+	// Shared: package-level variables, receiver identifiers, and unknown/unresolved
+	// identifiers. Local variables (function parameters and in-scope declarations)
+	// and import aliases are intentionally excluded.
+	for _, ev := range ctx.nameEvents {
+		if ev.kind != "use" {
+			continue
+		}
+		if ev.slot >= 0 {
+			if _, isImport := ctx.importSlots[ev.slot]; isImport {
+				continue
+			}
+		}
+		isShared := false
+		switch {
+		case ev.slot < 0:
+			// NAME_OVF (-1) and NAME_UNK (-2): conservatively treat as shared.
+			isShared = true
+		case ctx.recvSlot >= 0 && ev.slot == ctx.recvSlot:
+			// Method receiver: the struct it points to may be shared.
+			isShared = true
+		case ev.slot < ctx.packageSlots:
+			// Package-level variable, function, type, or constant.
+			isShared = true
+		}
+		if isShared {
+			ann.Shared = append(ann.Shared, ev.pos)
 		}
 	}
 
@@ -867,7 +998,37 @@ func (e *emitter) walk(n ast.Node) {
 		e.walk(v.Type)
 		e.emit("CLOSE_TYPE_ASSERT")
 	case *ast.CallExpr:
+		callStart := e.tokenCount
 		e.emit("OPEN_CALL")
+
+		// Detect synchronization primitive calls for race analysis.
+		var pendingSync *syncEvent
+		if e.funcCtx != nil {
+			if sel, ok := v.Fun.(*ast.SelectorExpr); ok && sel.Sel != nil {
+				if kind := syncMethodKind(sel.Sel.Name); kind != "" {
+					if id := leftmostIdent(sel.X); id != nil {
+						pendingSync = &syncEvent{
+							Start:    callStart,
+							Kind:     kind,
+							RecvSlot: e.slotOfName(id.Name),
+							Method:   sel.Sel.Name,
+						}
+					}
+				}
+				// sync/atomic package calls (e.g. atomic.AddInt64, atomic.Load).
+				if pendingSync == nil && sel.Sel != nil {
+					if id, ok := sel.X.(*ast.Ident); ok && id != nil && e.atomicPkgs[id.Name] {
+						pendingSync = &syncEvent{
+							Start:    callStart,
+							Kind:     "atomic",
+							RecvSlot: -1,
+							Method:   sel.Sel.Name,
+						}
+					}
+				}
+			}
+		}
+
 		e.walk(v.Fun)
 		for _, a := range v.Args {
 			e.walk(a)
@@ -876,6 +1037,11 @@ func (e *emitter) walk(n ast.Node) {
 			e.emit("ELLIPSIS")
 		}
 		e.emit("CLOSE_CALL")
+
+		if pendingSync != nil && e.funcCtx != nil {
+			pendingSync.End = e.tokenCount - 1
+			e.funcCtx.syncEvents = append(e.funcCtx.syncEvents, *pendingSync)
+		}
 	case *ast.KeyValueExpr:
 		e.emit("OPEN_KV")
 		e.walk(v.Key)
@@ -893,6 +1059,10 @@ func (e *emitter) walk(n ast.Node) {
 		outerCount := e.tokenCount
 		e.tokenCount = 0
 		e.funcCtx = buildFuncCtx(cfg.New(v.Body, func(*ast.CallExpr) bool { return true }), v.Body)
+		if e.funcCtx != nil {
+			e.funcCtx.packageSlots = len(e.nameStack)
+			e.funcCtx.importSlots = e.importSlots
+		}
 		e.emit("OPEN_FUNC_LIT")
 		e.enterScope()
 		e.walkFuncType(v.Type)
@@ -1108,7 +1278,11 @@ func (e *emitter) walk(n ast.Node) {
 		e.exitScope()
 		e.emit("CLOSE_COMM_CLAUSE")
 	case *ast.GoStmt:
+		goPos := e.tokenCount
 		e.emit("OPEN_GO")
+		if e.funcCtx != nil {
+			e.funcCtx.goSpawns = append(e.funcCtx.goSpawns, goPos)
+		}
 		e.walk(v.Call)
 		e.emit("CLOSE_GO")
 	case *ast.DeferStmt:
@@ -1182,11 +1356,23 @@ func (e *emitter) walk(n ast.Node) {
 		if v.Body != nil {
 			e.funcCtx = buildFuncCtx(cfg.New(v.Body, func(*ast.CallExpr) bool { return true }), v.Body)
 		}
+		if e.funcCtx != nil {
+			funcKey := e.pkgName + "." + v.Name.Name
+			if v.Recv != nil && len(v.Recv.List) > 0 {
+				funcKey = e.pkgName + ".(" + recvTypeString(v.Recv.List[0].Type) + ")." + v.Name.Name
+			}
+			e.funcCtx.funcName = funcKey
+			e.funcCtx.packageSlots = len(e.nameStack)
+			e.funcCtx.importSlots = e.importSlots
+		}
 		e.emit("OPEN_FUNC_DECL")
 		e.enterScope()
 		if v.Recv != nil {
 			e.emit("OPEN_RECV")
 			e.walkFieldList(v.Recv, introduceNames)
+			if e.funcCtx != nil && len(v.Recv.List) > 0 && len(v.Recv.List[0].Names) > 0 {
+				e.funcCtx.recvSlot = e.slotOfName(v.Recv.List[0].Names[0].Name)
+			}
 			e.emit("CLOSE_RECV")
 			// method name is a field-space identifier (same space as selector.Sel)
 			e.field(v.Name.Name)
@@ -1269,12 +1455,26 @@ func (e *emitter) collectPackageNames(file *ast.File) {
 			for _, spec := range d.Specs {
 				switch s := spec.(type) {
 				case *ast.ImportSpec:
+					if s.Path == nil {
+						continue
+					}
+					local := ""
+					base := extractImportName(s.Path.Value)
 					if s.Name != nil {
 						if s.Name.Name != "." && s.Name.Name != "_" {
-							e.register(s.Name.Name)
+							local = s.Name.Name
 						}
 					} else {
-						e.register(extractImportName(s.Path.Value))
+						local = base
+					}
+					if local != "" {
+						slot := e.register(local)
+						if slot >= 0 {
+							e.importSlots[slot] = struct{}{}
+						}
+						if base == "atomic" {
+							e.atomicPkgs[local] = true
+						}
 					}
 				case *ast.ValueSpec:
 					for _, n := range s.Names {
@@ -1310,7 +1510,13 @@ func typeCheckFile(fset *token.FileSet, file *ast.File) *types.Info {
 	return info
 }
 
-func tokenizeFile(path string, w *bufio.Writer) error {
+func tokenizeFile(path string, w *bufio.Writer) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("panic: %v\n%s", r, debug.Stack())
+		}
+	}()
+
 	fset := token.NewFileSet()
 	src, err := os.ReadFile(path)
 	if err != nil {
@@ -1321,7 +1527,8 @@ func tokenizeFile(path string, w *bufio.Writer) error {
 		return err
 	}
 	typeInfo := typeCheckFile(fset, file)
-	e := newEmitter(w, fset, typeInfo)
+	pkgName := file.Name.Name
+	e := newEmitter(w, fset, typeInfo, pkgName)
 	e.emit("BOS")
 	e.enterScope() // package scope
 	e.collectPackageNames(file)

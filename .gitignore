@@ -12,20 +12,41 @@ synth_eval/
 
 # build artifacts
 /ast-tokenize
+/ast-callgraph
 
 # pretraining outputs
 /data/
+/data_v1/
 /data_v2/
 /data_v3/
+/data_race/
+/data_race_merged/
+/data_race_synth/
+/data_race_test/
 /checkpoints/
+/checkpoints_v1/
+/checkpoints_v2/
+/checkpoints_v3/
 /checkpoints_risk/
+/checkpoints_risk_v1/
 /checkpoints_risk_v2/
 /checkpoints_risk_v3/
 /checkpoints_risk_v4/
 /checkpoints_risk_v5/
 /checkpoints_risk_v6/
-/checkpoints_v2/
-/checkpoints_v3/
+/checkpoints_race/
+/checkpoints_race_old/
+/checkpoints_race_v2/
+
+# temporary / log files
+/_tmp_cg/
+/polyscam_race_*.log
+/prepare_v1.log
+
+# evaluation corpora
+/synth_eval_race/
+/synth_eval_race_manual/
+/synth_eval_race_test/
 
 # environment variables
 .env

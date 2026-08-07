@@ -13,6 +13,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from astrolabe.vocab import PAD_ID
+
 
 @dataclass
 class GPTConfig:
@@ -121,6 +123,8 @@ class GPT(nn.Module):
         dom_pairs: torch.Tensor | None = None,
         nil_labels: torch.Tensor | None = None,
         bounds_labels: torch.Tensor | None = None,
+        nil_pos_weight: float | None = None,
+        bounds_pos_weight: float | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor | None,
@@ -188,13 +192,37 @@ class GPT(nn.Module):
 
         if nil_labels is not None:
             nil_logits = self.risk_nil_head(h).squeeze(-1)  # (B, T)
-            nil_loss = F.binary_cross_entropy_with_logits(nil_logits, nil_labels.float())
+            nil_pw = (
+                torch.tensor(nil_pos_weight, device=nil_logits.device, dtype=nil_logits.dtype)
+                if nil_pos_weight is not None else None
+            )
+            nil_loss = F.binary_cross_entropy_with_logits(
+                nil_logits, nil_labels.float(), pos_weight=nil_pw
+            )
 
         if bounds_labels is not None:
             bounds_logits = self.risk_bounds_head(h).squeeze(-1)  # (B, T)
-            bounds_loss = F.binary_cross_entropy_with_logits(bounds_logits, bounds_labels.float())
+            bounds_pw = (
+                torch.tensor(bounds_pos_weight, device=bounds_logits.device, dtype=bounds_logits.dtype)
+                if bounds_pos_weight is not None else None
+            )
+            bounds_loss = F.binary_cross_entropy_with_logits(
+                bounds_logits, bounds_labels.float(), pos_weight=bounds_pw
+            )
 
         return logits, lm_loss, bb_loss, du_loss, edge_loss, dom_loss, nil_loss, bounds_loss
+
+    def encode(self, idx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return final hidden states and a padding mask for the input sequence."""
+        B, T = idx.shape
+        assert T <= self.cfg.block_size, f"seq len {T} > block_size"
+        pos = torch.arange(T, device=idx.device)
+        h = self.drop(self.tok_emb(idx) + self.pos_emb(pos))
+        for block in self.blocks:
+            h = block(h)
+        h = self.ln_f(h)
+        mask = idx != PAD_ID
+        return h, mask
 
     @torch.no_grad()
     def generate(
@@ -253,3 +281,202 @@ class GPT(nn.Module):
             if p.item() >= threshold
         ]
         return nil_risks, bounds_risks
+
+
+class ContextSelfAttention(nn.Module):
+    """Bidirectional self-attention for the function-level context aggregator."""
+
+    def __init__(self, cfg: GPTConfig):
+        super().__init__()
+        assert cfg.n_embd % cfg.n_head == 0
+        self.qkv = nn.Linear(cfg.n_embd, 3 * cfg.n_embd, bias=False)
+        self.proj = nn.Linear(cfg.n_embd, cfg.n_embd, bias=False)
+        self.n_head = cfg.n_head
+        self.head_dim = cfg.n_embd // cfg.n_head
+        self.dropout = cfg.dropout
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, T, C = x.shape
+        q, k, v = self.qkv(x).split(C, dim=2)
+        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        y = F.scaled_dot_product_attention(
+            q, k, v,
+            dropout_p=self.dropout if self.training else 0.0,
+            is_causal=False,
+        )
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        return self.proj(y)
+
+
+class ContextBlock(nn.Module):
+    def __init__(self, cfg: GPTConfig):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(cfg.n_embd)
+        self.attn = ContextSelfAttention(cfg)
+        self.ln2 = nn.LayerNorm(cfg.n_embd)
+        self.mlp = MLP(cfg)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.attn(self.ln1(x))
+        x = x + self.mlp(self.ln2(x))
+        return x
+
+
+class HierarchicalRiskGPT(nn.Module):
+    """Hierarchical model for race-condition detection.
+
+    L1 is a pretrained GPT backbone. It encodes the target function and each
+    depth-1 caller independently. L2 is a small bidirectional transformer over
+    function embeddings that produces a context-aware target representation.
+    The race head fuses each token-level L1 state with the L2 context vector.
+    """
+
+    def __init__(self, cfg: GPTConfig, n_ctx_layers: int = 2, max_callers: int = 8):
+        super().__init__()
+        self.cfg = cfg
+        self.max_callers = max_callers
+
+        self.l1 = GPT(cfg)
+        self.ctx_blocks = nn.ModuleList(ContextBlock(cfg) for _ in range(n_ctx_layers))
+        self.ctx_ln = nn.LayerNorm(cfg.n_embd)
+        self.risk_race_head = nn.Linear(cfg.n_embd * 2, 1, bias=False)
+
+        self.apply(self._init_weights)
+
+    @staticmethod
+    def _init_weights(m: nn.Module) -> None:
+        if isinstance(m, nn.Linear):
+            nn.init.normal_(m.weight, mean=0.0, std=0.02)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+        elif isinstance(m, nn.Embedding):
+            nn.init.normal_(m.weight, mean=0.0, std=0.02)
+
+    def num_params(self) -> int:
+        return sum(p.numel() for p in self.parameters())
+
+    @staticmethod
+    def _last_hidden(h: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """Extract the last non-pad hidden state for each sequence."""
+        B, T, C = h.shape
+        lengths = mask.sum(dim=1).clamp(min=1) - 1  # (B,)
+        return h[torch.arange(B, device=h.device), lengths]
+
+    def forward(
+        self,
+        target_ids: torch.Tensor,
+        caller_ids: torch.Tensor,
+        target_mask: torch.Tensor,
+        caller_mask: torch.Tensor,
+        caller_present: torch.Tensor,
+        race_labels: torch.Tensor | None = None,
+        nil_labels: torch.Tensor | None = None,
+        bounds_labels: torch.Tensor | None = None,
+        race_pos_weight: float | None = None,
+        nil_pos_weight: float | None = None,
+        bounds_pos_weight: float | None = None,
+    ) -> tuple[
+        torch.Tensor, torch.Tensor | None,
+        torch.Tensor | None, torch.Tensor | None,
+        torch.Tensor | None, torch.Tensor | None,
+    ]:
+        """
+        Args:
+            target_ids:     (B, T_t)
+            caller_ids:     (B, K, T_c)
+            target_mask:    (B, T_t)
+            caller_mask:    (B, K, T_c)
+            caller_present: (B, K) bool — true for real callers
+            race_labels:    (B, T_t) float
+            nil_labels:     (B, T_t) float
+            bounds_labels:  (B, T_t) float
+        Returns:
+            race_logits, race_loss, nil_logits, nil_loss, bounds_logits, bounds_loss
+        """
+        B = target_ids.size(0)
+        K = caller_ids.size(1)
+
+        # L1: encode target function.
+        h_t, _ = self.l1.encode(target_ids)  # (B, T_t, C)
+        z_t = self._last_hidden(h_t, target_mask)  # (B, C)
+
+        # L1: encode callers.
+        flat_caller_ids = caller_ids.view(B * K, -1)  # (B*K, T_c)
+        h_c_flat, _ = self.l1.encode(flat_caller_ids)  # (B*K, T_c, C)
+        flat_caller_mask = caller_mask.view(B * K, -1)
+        z_c_flat = self._last_hidden(h_c_flat, flat_caller_mask)  # (B*K, C)
+        z_c = z_c_flat.view(B, K, -1)  # (B, K, C)
+
+        # Zero out missing callers so they do not affect context aggregation.
+        z_c = z_c * caller_present.unsqueeze(-1).float()
+
+        # L2: context aggregator over [target, caller_1, ..., caller_K].
+        z_seq = torch.cat([z_t.unsqueeze(1), z_c], dim=1)  # (B, 1+K, C)
+        for block in self.ctx_blocks:
+            z_seq = block(z_seq)
+        z_seq = self.ctx_ln(z_seq)
+        z_ctx = z_seq[:, 0]  # (B, C)
+
+        # Fuse token-level states with the context vector for race prediction.
+        z_ctx_expanded = z_ctx.unsqueeze(1).expand_as(h_t)  # (B, T_t, C)
+        fused = torch.cat([h_t, z_ctx_expanded], dim=-1)  # (B, T_t, 2C)
+        race_logits = self.risk_race_head(fused).squeeze(-1)  # (B, T_t)
+
+        race_loss = nil_loss = bounds_loss = None
+        if race_labels is not None:
+            pw = (
+                torch.tensor(race_pos_weight, device=race_logits.device, dtype=race_logits.dtype)
+                if race_pos_weight is not None else None
+            )
+            race_loss = F.binary_cross_entropy_with_logits(
+                race_logits, race_labels.float(), pos_weight=pw, weight=target_mask.float()
+            )
+
+        # Nil / bounds heads use the L1 target states directly.
+        nil_logits = self.l1.risk_nil_head(h_t).squeeze(-1)
+        bounds_logits = self.l1.risk_bounds_head(h_t).squeeze(-1)
+
+        if nil_labels is not None:
+            pw = (
+                torch.tensor(nil_pos_weight, device=nil_logits.device, dtype=nil_logits.dtype)
+                if nil_pos_weight is not None else None
+            )
+            nil_loss = F.binary_cross_entropy_with_logits(
+                nil_logits, nil_labels.float(), pos_weight=pw, weight=target_mask.float()
+            )
+
+        if bounds_labels is not None:
+            pw = (
+                torch.tensor(bounds_pos_weight, device=bounds_logits.device, dtype=bounds_logits.dtype)
+                if bounds_pos_weight is not None else None
+            )
+            bounds_loss = F.binary_cross_entropy_with_logits(
+                bounds_logits, bounds_labels.float(), pos_weight=pw, weight=target_mask.float()
+            )
+
+        return race_logits, race_loss, nil_logits, nil_loss, bounds_logits, bounds_loss
+
+    @torch.no_grad()
+    def detect_race(
+        self,
+        target_ids: torch.Tensor,
+        caller_ids: torch.Tensor,
+        target_mask: torch.Tensor,
+        caller_mask: torch.Tensor,
+        caller_present: torch.Tensor,
+        threshold: float = 0.5,
+    ) -> list[tuple[int, float]]:
+        """Return risky target token positions with confidence."""
+        self.eval()
+        race_logits, *_ = self(
+            target_ids, caller_ids, target_mask, caller_mask, caller_present
+        )
+        probs = torch.sigmoid(race_logits).squeeze(0)  # (T_t,)
+        mask = target_mask.squeeze(0)  # (T_t,)
+        return [
+            (i, p.item())
+            for i, p in enumerate(probs)
+            if mask[i].item() and p.item() >= threshold
+        ]

@@ -1,13 +1,13 @@
-"""Fine-tune pretrained GPT with risk classification heads.
+"""Fine-tune HierarchicalRiskGPT for race-condition detection.
 
-Loads a pretrained checkpoint, freezes backbone for N steps, then low-LR
-fine-tunes the full model on nil-deref + bounds-check binary labels.
+Loads a pretrained GPT backbone, attaches the L2 context aggregator and race
+head, and fine-tunes on the mutated race corpus.
 
 Usage:
-    python -m astrolabe.finetune_risk \
-        --data-dir data \
-        --out-dir checkpoints_risk_v3 \
-        --resume checkpoints/ckpt_100000.pt
+    python -m astrolabe.finetune_race \
+        --data-dir data_race \
+        --out-dir checkpoints_race \
+        --resume /path/to/pretrained.pt
 """
 from __future__ import annotations
 
@@ -21,13 +21,13 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader
 
-from astrolabe.config import RiskTrainConfig
-from astrolabe.risk_dataset import RiskUnitDataset
-from astrolabe.model import GPT, GPTConfig
-from astrolabe.vocab import BOS_ID, VOCAB_SIZE, bracket_balance_rate
+from astrolabe.config import RaceTrainConfig
+from astrolabe.model import GPTConfig, HierarchicalRiskGPT
+from astrolabe.race_dataset import RaceContextDataset
+from astrolabe.vocab import VOCAB_SIZE
 
 
-def get_lr(step: int, cfg: RiskTrainConfig) -> float:
+def get_lr(step: int, cfg: RaceTrainConfig) -> float:
     if step < cfg.warmup_steps:
         return cfg.lr * (step + 1) / cfg.warmup_steps
     if step >= cfg.max_steps:
@@ -42,9 +42,9 @@ def _to(batch: tuple, device: str) -> tuple:
 
 
 @torch.no_grad()
-def evaluate(model: GPT, loader: DataLoader, device: str, iters: int) -> dict[str, float]:
+def evaluate(model: HierarchicalRiskGPT, loader: DataLoader, device: str, iters: int) -> dict[str, float]:
     model.eval()
-    totals: dict[str, float] = {k: 0.0 for k in ("total", "nil", "bounds")}
+    totals: dict[str, float] = {k: 0.0 for k in ("total", "race", "nil", "bounds")}
     counts: dict[str, int] = {k: 0 for k in totals}
     it = iter(loader)
     for _ in range(iters):
@@ -52,19 +52,17 @@ def evaluate(model: GPT, loader: DataLoader, device: str, iters: int) -> dict[st
             batch = next(it)
         except StopIteration:
             break
-        x, y, nil_l, bounds_l = _to(batch, device)
-        _, lm, bb, du, edge, dom, nil_loss, bounds_loss = model(
-            x, y, None, None, None, None, nil_l, bounds_l
+        t_ids, c_ids, t_mask, c_mask, c_pres, race_l, nil_l, bounds_l = _to(batch, device)
+        _, race_loss, _, nil_loss, _, bounds_loss = model(
+            t_ids, c_ids, t_mask, c_mask, c_pres,
+            race_labels=race_l, nil_labels=nil_l, bounds_labels=bounds_l,
         )
         loss = 0.0
-        if nil_loss is not None:
-            loss += nil_loss.item()
-            totals["nil"] += nil_loss.item()
-            counts["nil"] += 1
-        if bounds_loss is not None:
-            loss += bounds_loss.item()
-            totals["bounds"] += bounds_loss.item()
-            counts["bounds"] += 1
+        for name, val in (("race", race_loss), ("nil", nil_loss), ("bounds", bounds_loss)):
+            if val is not None:
+                loss += val.item()
+                totals[name] += val.item()
+                counts[name] += 1
         totals["total"] += loss
         counts["total"] += 1
     model.train()
@@ -72,7 +70,7 @@ def evaluate(model: GPT, loader: DataLoader, device: str, iters: int) -> dict[st
 
 
 def _arg_type(annotation: type, default):
-    """Return an argparse type for a config field annotation (including Optional[float])."""
+    """Return an argparse type for a config field annotation."""
     import types
     kind = annotation
     if kind is bool:
@@ -89,52 +87,60 @@ def _arg_type(annotation: type, default):
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
-    cfg = RiskTrainConfig()
-    annotations = typing.get_type_hints(RiskTrainConfig)
+    cfg = RaceTrainConfig()
+    annotations = typing.get_type_hints(RaceTrainConfig)
     for k, v in asdict(cfg).items():
+        if k == "resume":
+            continue
         ann = annotations.get(k, type(v))
         flag = "--" + k.replace("_", "-")
         p.add_argument(flag, type=_arg_type(ann, v), default=v)
-    p.add_argument("--resume", type=Path, required=True,
-                   help="Pretrained checkpoint to resume from")
-    p.add_argument("--max-units", type=int, default=None,
-                   help="Limit dataset to first N units (for POC)")
+    p.add_argument("--resume", type=Path, default=None,
+                   help="Pretrained checkpoint to load L1 from")
+    p.add_argument("--resume-ckpt", type=Path, default=None,
+                   help="Race checkpoint to resume training from (loads model + optimizer + step)")
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     resume = args.resume
-    max_units = args.max_units
-    del args.resume
-    del args.max_units
-    cfg = RiskTrainConfig(**vars(args))
+    cfg = RaceTrainConfig(**{k: v for k, v in vars(args).items() if k not in ("resume", "resume_ckpt")})
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    dtype = torch.bfloat16 if device == "cuda" and torch.cuda.is_bf16_supported() \
-        else torch.float32
+    dtype = torch.bfloat16 if device == "cuda" and torch.cuda.is_bf16_supported() else torch.float32
 
     torch.manual_seed(cfg.seed)
     cfg.out_dir.mkdir(parents=True, exist_ok=True)
 
-    train_ds = RiskUnitDataset(
+    train_ds = RaceContextDataset(
         cfg.data_dir / "train_units.bin",
         cfg.data_dir / "train_units.idx.npy",
-        None,
-        cfg.data_dir / "risk_train_v1.jsonl",
-        cfg.block_size,
-        max_units=max_units,
+        cfg.data_dir / "train_ann.jsonl",
+        cfg.data_dir / "race_train_meta.jsonl",
+        cfg.data_dir / "risk_train.jsonl",
+        func_len=cfg.func_len,
+        caller_len=cfg.caller_len,
+        max_callers=cfg.max_callers,
+        mutate_frac=0.5,
+        seed=cfg.seed,
+        deterministic=False,
     )
-    val_ds = RiskUnitDataset(
+    val_ds = RaceContextDataset(
         cfg.data_dir / "val_units.bin",
         cfg.data_dir / "val_units.idx.npy",
-        None,
-        cfg.data_dir / "risk_val_v1.jsonl",
-        cfg.block_size,
-        max_units=max_units,
+        cfg.data_dir / "val_ann.jsonl",
+        cfg.data_dir / "race_val_meta.jsonl",
+        cfg.data_dir / "risk_val.jsonl",
+        func_len=cfg.func_len,
+        caller_len=cfg.caller_len,
+        max_callers=cfg.max_callers,
+        mutate_frac=0.5,
+        seed=cfg.seed,
+        deterministic=True,
     )
-    train_dl = DataLoader(train_ds, batch_size=cfg.batch_size, num_workers=0)
-    val_dl   = DataLoader(val_ds,   batch_size=cfg.batch_size, num_workers=0)
+    train_dl = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True, num_workers=0)
+    val_dl = DataLoader(val_ds, batch_size=cfg.batch_size, num_workers=0)
 
     gpt_cfg = GPTConfig(
         vocab_size=VOCAB_SIZE,
@@ -144,7 +150,9 @@ def main() -> None:
         n_embd=cfg.n_embd,
         dropout=cfg.dropout,
     )
-    model = GPT(gpt_cfg).to(device)
+    model = HierarchicalRiskGPT(
+        gpt_cfg, n_ctx_layers=cfg.n_ctx_layers, max_callers=cfg.max_callers
+    ).to(device)
     print(f"model params: {model.num_params() / 1e6:.2f}M  "
           f"vocab: {VOCAB_SIZE}  device: {device}  dtype: {dtype}")
 
@@ -159,19 +167,33 @@ def main() -> None:
     )
 
     step = 0
-    ckpt = torch.load(resume, map_location=device, weights_only=False)
-    model.load_state_dict(ckpt["model"], strict=False)
-    # opt state from pretraining is not useful for new heads; skip it.
-    print(f"loaded pretrained checkpoint from {resume}")
+    if args.resume_ckpt is not None:
+        ckpt = torch.load(args.resume_ckpt, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model"])
+        opt.load_state_dict(ckpt["opt"])
+        step = ckpt.get("step", 0)
+        print(f"resumed race checkpoint from {args.resume_ckpt} at step {step}")
+    elif resume is not None:
+        ckpt = torch.load(resume, map_location=device, weights_only=False)
+        model.l1.load_state_dict(ckpt["model"], strict=False)
+        print(f"loaded pretrained L1 from {resume}")
 
-    # Freeze backbone parameters for first N steps.
-    risk_params = list(model.risk_nil_head.parameters()) + list(model.risk_bounds_head.parameters())
+    # Freeze backbone for the initial warmup period.
+    risk_params = []
+    for name, p in model.named_parameters():
+        if not name.startswith("l1."):
+            risk_params.append(p)
     for p in model.parameters():
         p.requires_grad = False
     for p in risk_params:
         p.requires_grad = True
 
-    running: dict[str, float] = {k: 0.0 for k in ("total", "nil", "bounds")}
+    # If resuming past the freeze period, unfreeze immediately.
+    if step >= cfg.freeze_backbone_steps:
+        for p in model.parameters():
+            p.requires_grad = True
+
+    running: dict[str, float] = {"total": 0.0, "race": 0.0, "nil": 0.0, "bounds": 0.0}
     running_n = 0
     t0 = time.time()
     train_iter = iter(train_dl)
@@ -181,7 +203,6 @@ def main() -> None:
         for g in opt.param_groups:
             g["lr"] = lr
 
-        # Unfreeze backbone after freeze period.
         if step == cfg.freeze_backbone_steps:
             for p in model.parameters():
                 p.requires_grad = True
@@ -195,14 +216,20 @@ def main() -> None:
                 train_iter = iter(train_dl)
                 batch = next(train_iter)
 
-            x, y, nil_l, bounds_l = _to(batch, device)
+            t_ids, c_ids, t_mask, c_mask, c_pres, race_l, nil_l, bounds_l = _to(batch, device)
             with torch.autocast(device_type=device, dtype=dtype, enabled=(device == "cuda")):
-                _, lm_loss, bb_loss, du_loss, edge_loss, dom_loss, nil_loss, bounds_loss = model(
-                    x, y, None, None, None, None, nil_l, bounds_l,
+                _, race_loss, _, nil_loss, _, bounds_loss = model(
+                    t_ids, c_ids, t_mask, c_mask, c_pres,
+                    race_labels=race_l,
+                    nil_labels=nil_l,
+                    bounds_labels=bounds_l,
+                    race_pos_weight=cfg.risk_race_pos_weight,
                     nil_pos_weight=cfg.risk_nil_pos_weight,
                     bounds_pos_weight=cfg.risk_bounds_pos_weight,
                 )
                 loss = 0.0
+                if race_loss is not None and cfg.risk_race_weight > 0:
+                    loss = loss + cfg.risk_race_weight * race_loss
                 if nil_loss is not None and cfg.risk_nil_weight > 0:
                     loss = loss + cfg.risk_nil_weight * nil_loss
                 if bounds_loss is not None and cfg.risk_bounds_weight > 0:
@@ -210,7 +237,7 @@ def main() -> None:
                 loss = loss / cfg.grad_accum_steps
 
             loss.backward()
-            for name, val in (("nil", nil_loss), ("bounds", bounds_loss)):
+            for name, val in (("race", race_loss), ("nil", nil_loss), ("bounds", bounds_loss)):
                 if val is not None:
                     running[name] += val.item()
             running["total"] += loss.item() * cfg.grad_accum_steps
@@ -223,10 +250,7 @@ def main() -> None:
 
         if step % cfg.log_interval == 0:
             scale = max(1, running_n)
-            parts = "  ".join(
-                f"{k} {running[k] / scale:.4f}"
-                for k in ("total", "nil", "bounds")
-            )
+            parts = "  ".join(f"{k} {running[k] / scale:.4f}" for k in ("total", "race", "nil", "bounds"))
             dt = (time.time() - t0) / cfg.log_interval
             print(f"step {step:6d}  {parts}  lr {lr:.2e}  {dt*1000:.0f}ms/step", flush=True)
             for k in running:
@@ -245,7 +269,7 @@ def main() -> None:
                 "cfg": asdict(cfg),
                 "gpt_cfg": asdict(gpt_cfg),
             }
-            torch.save(ckpt, cfg.out_dir / f"ckpt_risk_{step}.pt")
+            torch.save(ckpt, cfg.out_dir / f"ckpt_race_{step}.pt")
 
 
 if __name__ == "__main__":
