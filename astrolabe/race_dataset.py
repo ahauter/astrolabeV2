@@ -71,14 +71,16 @@ class RaceContextDataset(Dataset):
     """Loads base corpus units and applies online sync mutation.
 
     Returns:
-        target_ids:     (func_len,)
-        caller_ids:     (max_callers, caller_len)
-        target_mask:    (func_len,)
-        caller_mask:    (max_callers, caller_len)
-        caller_present: (max_callers,)
-        race_labels:    (func_len,)
-        nil_labels:     (func_len,)
-        bounds_labels:  (func_len,)
+        target_ids:       (func_len,)
+        caller_ids:       (max_callers, caller_len)
+        target_mask:      (func_len,)
+        caller_mask:      (max_callers, caller_len)
+        caller_present:   (max_callers,)
+        race_labels:      (func_len,)
+        nil_labels:       (func_len,)
+        bounds_labels:    (func_len,)
+        target_sync_mask: (func_len,)
+        race_weight_mask: (func_len,)
     """
 
     def __init__(
@@ -88,10 +90,12 @@ class RaceContextDataset(Dataset):
         ann_path: Path,
         meta_path: Path,
         risk_path: Path,
+        static_race_path: Path | None = None,
         func_len: int = 256,
         caller_len: int = 128,
         max_callers: int = 8,
-        mutate_frac: float = 0.5,
+        mutate_frac: float = 0.2,
+        sync_neg_weight: float = 5.0,
         seed: int = 0,
         deterministic: bool = False,
         epoch_samples: int | None = None,
@@ -103,6 +107,7 @@ class RaceContextDataset(Dataset):
         self.ann_path = Path(ann_path)
         self.meta_path = Path(meta_path)
         self.risk_path = Path(risk_path)
+        self.static_race_path = Path(static_race_path) if static_race_path else None
 
         # Precompute (or load) byte offsets for each line in the JSONL files.
         self.ann_offsets = _build_line_offsets(self.ann_path)
@@ -114,15 +119,25 @@ class RaceContextDataset(Dataset):
         self._meta_f = open(self.meta_path, "rb")
         self._risk_f = open(self.risk_path, "rb")
 
+        if self.static_race_path:
+            self.static_race_offsets = _build_line_offsets(self.static_race_path)
+            self._static_race_f = open(self.static_race_path, "rb")
+        else:
+            self.static_race_offsets = None
+            self._static_race_f = None
+
         if not (len(self.ann_offsets) - 1 == self.n_units
                 and len(self.meta_offsets) - 1 == self.n_units
                 and len(self.risk_offsets) - 1 == self.n_units):
             raise ValueError("mismatch between units and offset files")
+        if self.static_race_offsets is not None and len(self.static_race_offsets) - 1 != self.n_units:
+            raise ValueError("mismatch between units and static race risk file")
 
         self.func_len = func_len
         self.caller_len = caller_len
         self.max_callers = max_callers
         self.mutate_frac = mutate_frac
+        self.sync_neg_weight = sync_neg_weight
         self.seed = seed
         self.deterministic = deterministic
         self.epoch_samples = epoch_samples or self.n_units
@@ -154,6 +169,11 @@ class RaceContextDataset(Dataset):
     def _risk(self, idx: int) -> dict:
         return _read_line(self._risk_f, self.risk_offsets, idx)
 
+    def _static_race(self, idx: int) -> dict:
+        if self._static_race_f is None:
+            return {}
+        return _read_line(self._static_race_f, self.static_race_offsets, idx)
+
     def __getitem__(self, idx: int) -> tuple[
         torch.Tensor, torch.Tensor, torch.Tensor,
         torch.Tensor, torch.Tensor, torch.Tensor,
@@ -166,24 +186,37 @@ class RaceContextDataset(Dataset):
 
         original_tokens = self._load_unit(idx)
         mutate = self._should_mutate(idx, ann)
+        static_race = self._static_race(idx).get("race_risks", [])
+        sync_positions = _sync_positions(ann)
 
         if mutate:
-            sync_positions = _sync_positions(ann)
             target_tokens, pos_map = _remove_positions(original_tokens, sync_positions)
-            race_labels = _race_labels(original_tokens, target_tokens, pos_map, ann)
+            mutated_race = _race_labels(original_tokens, target_tokens, pos_map, ann)
+            static_race_mapped = _map_positions(static_race, pos_map)
+            race_labels = sorted(set(mutated_race) | set(static_race_mapped))
             nil_labels = _map_positions(risk.get("nil_risks", []), pos_map)
             bounds_labels = _map_positions(risk.get("bounds_risks", []), pos_map)
+            target_sync_labels: list[int] = []
         else:
             target_tokens = original_tokens
-            race_labels = []
+            race_labels = static_race
             nil_labels = risk.get("nil_risks", [])
             bounds_labels = risk.get("bounds_risks", [])
+            target_sync_labels = sorted(sync_positions)
 
         target_ids, target_mask = _pad_sequence(target_tokens, self.func_len)
 
         race_vec = _positions_to_vec(race_labels, self.func_len)
         nil_vec = _positions_to_vec(nil_labels, self.func_len)
         bounds_vec = _positions_to_vec(bounds_labels, self.func_len)
+        target_sync_vec = _positions_to_vec(target_sync_labels, self.func_len)
+
+        # Hard-negative weighting: sync-protected positions that are not
+        # race positives receive higher loss weight.
+        hard_neg = target_sync_vec * (1.0 - race_vec)
+        race_weight_vec = target_mask.astype(np.float32) * (
+            1.0 + (self.sync_neg_weight - 1.0) * hard_neg
+        )
 
         caller_ids = np.full((self.max_callers, self.caller_len), PAD_ID, dtype=np.int64)
         caller_mask = np.zeros((self.max_callers, self.caller_len), dtype=np.bool_)
@@ -206,10 +239,12 @@ class RaceContextDataset(Dataset):
             torch.from_numpy(race_vec),
             torch.from_numpy(nil_vec),
             torch.from_numpy(bounds_vec),
+            torch.from_numpy(target_sync_vec),
+            torch.from_numpy(race_weight_vec),
         )
 
     def __del__(self):
-        for f in (self._ann_f, self._meta_f, self._risk_f):
+        for f in (self._ann_f, self._meta_f, self._risk_f, self._static_race_f):
             try:
                 f.close()
             except Exception:

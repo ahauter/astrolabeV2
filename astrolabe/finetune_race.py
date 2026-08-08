@@ -52,10 +52,11 @@ def evaluate(model: HierarchicalRiskGPT, loader: DataLoader, device: str, iters:
             batch = next(it)
         except StopIteration:
             break
-        t_ids, c_ids, t_mask, c_mask, c_pres, race_l, nil_l, bounds_l = _to(batch, device)
+        t_ids, c_ids, t_mask, c_mask, c_pres, race_l, nil_l, bounds_l, t_sync, race_w = _to(batch, device)
         _, race_loss, _, nil_loss, _, bounds_loss = model(
             t_ids, c_ids, t_mask, c_mask, c_pres,
             race_labels=race_l, nil_labels=nil_l, bounds_labels=bounds_l,
+            target_sync_mask=t_sync, race_weight_mask=race_w,
         )
         loss = 0.0
         for name, val in (("race", race_loss), ("nil", nil_loss), ("bounds", bounds_loss)):
@@ -119,10 +120,12 @@ def main() -> None:
         cfg.data_dir / "train_ann.jsonl",
         cfg.data_dir / "race_train_meta.jsonl",
         cfg.data_dir / "risk_train.jsonl",
+        static_race_path=cfg.data_dir / "race_risk_train.jsonl",
         func_len=cfg.func_len,
         caller_len=cfg.caller_len,
         max_callers=cfg.max_callers,
-        mutate_frac=0.5,
+        mutate_frac=0.2,
+        sync_neg_weight=cfg.sync_neg_weight,
         seed=cfg.seed,
         deterministic=False,
     )
@@ -132,10 +135,12 @@ def main() -> None:
         cfg.data_dir / "val_ann.jsonl",
         cfg.data_dir / "race_val_meta.jsonl",
         cfg.data_dir / "risk_val.jsonl",
+        static_race_path=cfg.data_dir / "race_risk_val.jsonl",
         func_len=cfg.func_len,
         caller_len=cfg.caller_len,
         max_callers=cfg.max_callers,
-        mutate_frac=0.5,
+        mutate_frac=0.2,
+        sync_neg_weight=cfg.sync_neg_weight,
         seed=cfg.seed,
         deterministic=True,
     )
@@ -159,24 +164,27 @@ def main() -> None:
     if cfg.compile:
         model = torch.compile(model)
 
+    step = 0
+    if args.resume_ckpt is not None:
+        ckpt = torch.load(args.resume_ckpt, map_location=device, weights_only=False)
+        missing, unexpected = model.load_state_dict(ckpt["model"], strict=False)
+        step = ckpt.get("step", 0)
+        print(f"resumed race checkpoint from {args.resume_ckpt} at step {step}")
+        if missing:
+            print(f"  missing keys (will be freshly initialized): {missing[:5]}{' ...' if len(missing) > 5 else ''}")
+        if unexpected:
+            print(f"  unexpected keys: {unexpected[:5]}{' ...' if len(unexpected) > 5 else ''}")
+    elif resume is not None:
+        ckpt = torch.load(resume, map_location=device, weights_only=False)
+        model.l1.load_state_dict(ckpt["model"], strict=False)
+        print(f"loaded pretrained L1 from {resume}")
+
     opt = torch.optim.AdamW(
         model.parameters(),
         lr=cfg.lr,
         betas=(cfg.beta1, cfg.beta2),
         weight_decay=cfg.weight_decay,
     )
-
-    step = 0
-    if args.resume_ckpt is not None:
-        ckpt = torch.load(args.resume_ckpt, map_location=device, weights_only=False)
-        model.load_state_dict(ckpt["model"])
-        opt.load_state_dict(ckpt["opt"])
-        step = ckpt.get("step", 0)
-        print(f"resumed race checkpoint from {args.resume_ckpt} at step {step}")
-    elif resume is not None:
-        ckpt = torch.load(resume, map_location=device, weights_only=False)
-        model.l1.load_state_dict(ckpt["model"], strict=False)
-        print(f"loaded pretrained L1 from {resume}")
 
     # Freeze backbone for the initial warmup period.
     risk_params = []
@@ -216,13 +224,15 @@ def main() -> None:
                 train_iter = iter(train_dl)
                 batch = next(train_iter)
 
-            t_ids, c_ids, t_mask, c_mask, c_pres, race_l, nil_l, bounds_l = _to(batch, device)
+            t_ids, c_ids, t_mask, c_mask, c_pres, race_l, nil_l, bounds_l, t_sync, race_w = _to(batch, device)
             with torch.autocast(device_type=device, dtype=dtype, enabled=(device == "cuda")):
                 _, race_loss, _, nil_loss, _, bounds_loss = model(
                     t_ids, c_ids, t_mask, c_mask, c_pres,
                     race_labels=race_l,
                     nil_labels=nil_l,
                     bounds_labels=bounds_l,
+                    target_sync_mask=t_sync,
+                    race_weight_mask=race_w,
                     race_pos_weight=cfg.risk_race_pos_weight,
                     nil_pos_weight=cfg.risk_nil_pos_weight,
                     bounds_pos_weight=cfg.risk_bounds_pos_weight,

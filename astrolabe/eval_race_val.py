@@ -35,14 +35,15 @@ def evaluate(model: HierarchicalRiskGPT, ds: RaceContextDataset, device: str, th
         indices = range(len(ds))
     with torch.no_grad():
         for idx in indices:
-            t_ids, c_ids, t_mask, c_mask, c_pres, race_l, _, _ = ds[idx]
+            t_ids, c_ids, t_mask, c_mask, c_pres, race_l, _, _, t_sync, _ = ds[idx]
             t_ids = t_ids.unsqueeze(0).to(device)
             c_ids = c_ids.unsqueeze(0).to(device)
             t_mask = t_mask.unsqueeze(0).to(device)
             c_mask = c_mask.unsqueeze(0).to(device)
             c_pres = c_pres.unsqueeze(0).to(device)
+            t_sync = t_sync.unsqueeze(0).to(device)
 
-            preds = model.detect_race(t_ids, c_ids, t_mask, c_mask, c_pres, threshold=threshold)
+            preds = model.detect_race(t_ids, c_ids, t_mask, c_mask, c_pres, target_sync_mask=t_sync, threshold=threshold)
             pred_positions = {int(p) for p, _ in preds}
             gt_positions = {int(i) for i, v in enumerate(race_l) if v.item() > 0}
 
@@ -97,10 +98,12 @@ def main() -> None:
         args.data_dir / "val_ann.jsonl",
         args.data_dir / "race_val_meta.jsonl",
         args.data_dir / "risk_val.jsonl",
+        static_race_path=args.data_dir / "race_risk_val.jsonl",
         func_len=cfg.func_len,
         caller_len=cfg.caller_len,
         max_callers=cfg.max_callers,
-        mutate_frac=0.5,
+        mutate_frac=0.2,
+        sync_neg_weight=cfg.sync_neg_weight,
         seed=cfg.seed,
         deterministic=True,
     )

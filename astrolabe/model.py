@@ -82,6 +82,7 @@ class GPT(nn.Module):
         self.cfg = cfg
         self.tok_emb = nn.Embedding(cfg.vocab_size, cfg.n_embd)
         self.pos_emb = nn.Embedding(cfg.block_size, cfg.n_embd)
+        self.sync_emb = nn.Embedding(2, cfg.n_embd)
         self.drop = nn.Dropout(cfg.dropout)
         self.blocks = nn.ModuleList(Block(cfg) for _ in range(cfg.n_layer))
         self.ln_f = nn.LayerNorm(cfg.n_embd)
@@ -123,6 +124,7 @@ class GPT(nn.Module):
         dom_pairs: torch.Tensor | None = None,
         nil_labels: torch.Tensor | None = None,
         bounds_labels: torch.Tensor | None = None,
+        sync_mask: torch.Tensor | None = None,
         nil_pos_weight: float | None = None,
         bounds_pos_weight: float | None = None,
     ) -> tuple[
@@ -139,6 +141,8 @@ class GPT(nn.Module):
         assert T <= self.cfg.block_size, f"seq len {T} > block_size"
         pos = torch.arange(T, device=idx.device)
         h = self.drop(self.tok_emb(idx) + self.pos_emb(pos))
+        if sync_mask is not None:
+            h = h + self.sync_emb(sync_mask.long())
         for block in self.blocks:
             h = block(h)
         h = self.ln_f(h)
@@ -212,12 +216,14 @@ class GPT(nn.Module):
 
         return logits, lm_loss, bb_loss, du_loss, edge_loss, dom_loss, nil_loss, bounds_loss
 
-    def encode(self, idx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def encode(self, idx: torch.Tensor, sync_mask: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
         """Return final hidden states and a padding mask for the input sequence."""
         B, T = idx.shape
         assert T <= self.cfg.block_size, f"seq len {T} > block_size"
         pos = torch.arange(T, device=idx.device)
         h = self.drop(self.tok_emb(idx) + self.pos_emb(pos))
+        if sync_mask is not None:
+            h = h + self.sync_emb(sync_mask.long())
         for block in self.blocks:
             h = block(h)
         h = self.ln_f(h)
@@ -248,6 +254,7 @@ class GPT(nn.Module):
     def detect_risks(
         self,
         idx: torch.Tensor,
+        sync_mask: torch.Tensor | None = None,
         threshold: float = 0.5,
     ) -> tuple[list[tuple[int, float]], list[tuple[int, float]]]:
         """Run forward on a single sequence and return risky positions.
@@ -260,6 +267,8 @@ class GPT(nn.Module):
         B, T = idx.shape
         pos = torch.arange(T, device=idx.device)
         h = self.drop(self.tok_emb(idx) + self.pos_emb(pos))
+        if sync_mask is not None:
+            h = h + self.sync_emb(sync_mask.long())
         for block in self.blocks:
             h = block(h)
         h = self.ln_f(h)
@@ -374,6 +383,9 @@ class HierarchicalRiskGPT(nn.Module):
         race_labels: torch.Tensor | None = None,
         nil_labels: torch.Tensor | None = None,
         bounds_labels: torch.Tensor | None = None,
+        target_sync_mask: torch.Tensor | None = None,
+        caller_sync_mask: torch.Tensor | None = None,
+        race_weight_mask: torch.Tensor | None = None,
         race_pos_weight: float | None = None,
         nil_pos_weight: float | None = None,
         bounds_pos_weight: float | None = None,
@@ -392,6 +404,9 @@ class HierarchicalRiskGPT(nn.Module):
             race_labels:    (B, T_t) float
             nil_labels:     (B, T_t) float
             bounds_labels:  (B, T_t) float
+            target_sync_mask: (B, T_t) bool — true inside sync event token ranges
+            caller_sync_mask: (B, K, T_c) bool — true inside sync event token ranges
+            race_weight_mask: (B, T_t) float — per-token loss weight
         Returns:
             race_logits, race_loss, nil_logits, nil_loss, bounds_logits, bounds_loss
         """
@@ -399,12 +414,15 @@ class HierarchicalRiskGPT(nn.Module):
         K = caller_ids.size(1)
 
         # L1: encode target function.
-        h_t, _ = self.l1.encode(target_ids)  # (B, T_t, C)
+        h_t, _ = self.l1.encode(target_ids, sync_mask=target_sync_mask)  # (B, T_t, C)
         z_t = self._last_hidden(h_t, target_mask)  # (B, C)
 
         # L1: encode callers.
         flat_caller_ids = caller_ids.view(B * K, -1)  # (B*K, T_c)
-        h_c_flat, _ = self.l1.encode(flat_caller_ids)  # (B*K, T_c, C)
+        flat_caller_sync_mask = None
+        if caller_sync_mask is not None:
+            flat_caller_sync_mask = caller_sync_mask.view(B * K, -1)
+        h_c_flat, _ = self.l1.encode(flat_caller_ids, sync_mask=flat_caller_sync_mask)  # (B*K, T_c, C)
         flat_caller_mask = caller_mask.view(B * K, -1)
         z_c_flat = self._last_hidden(h_c_flat, flat_caller_mask)  # (B*K, C)
         z_c = z_c_flat.view(B, K, -1)  # (B, K, C)
@@ -430,8 +448,11 @@ class HierarchicalRiskGPT(nn.Module):
                 torch.tensor(race_pos_weight, device=race_logits.device, dtype=race_logits.dtype)
                 if race_pos_weight is not None else None
             )
+            loss_weight = target_mask.float()
+            if race_weight_mask is not None:
+                loss_weight = loss_weight * race_weight_mask
             race_loss = F.binary_cross_entropy_with_logits(
-                race_logits, race_labels.float(), pos_weight=pw, weight=target_mask.float()
+                race_logits, race_labels.float(), pos_weight=pw, weight=loss_weight
             )
 
         # Nil / bounds heads use the L1 target states directly.
@@ -466,12 +487,14 @@ class HierarchicalRiskGPT(nn.Module):
         target_mask: torch.Tensor,
         caller_mask: torch.Tensor,
         caller_present: torch.Tensor,
+        target_sync_mask: torch.Tensor | None = None,
         threshold: float = 0.5,
     ) -> list[tuple[int, float]]:
         """Return risky target token positions with confidence."""
         self.eval()
         race_logits, *_ = self(
-            target_ids, caller_ids, target_mask, caller_mask, caller_present
+            target_ids, caller_ids, target_mask, caller_mask, caller_present,
+            target_sync_mask=target_sync_mask,
         )
         probs = torch.sigmoid(race_logits).squeeze(0)  # (T_t,)
         mask = target_mask.squeeze(0)  # (T_t,)

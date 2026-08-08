@@ -37,6 +37,7 @@ synth_eval/
 /checkpoints_race/
 /checkpoints_race_old/
 /checkpoints_race_v2/
+/checkpoints_race_v3/
 
 # temporary / log files
 /_tmp_cg/

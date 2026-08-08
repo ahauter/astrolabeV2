@@ -121,6 +121,9 @@ class RaceTrainConfig:
     risk_bounds_weight: float = 2.0
     risk_bounds_pos_weight: float | None = None
 
+    # sync hard-negative weighting
+    sync_neg_weight: float = 5.0
+
     # freeze schedule
     freeze_backbone_steps: int = 1000
 

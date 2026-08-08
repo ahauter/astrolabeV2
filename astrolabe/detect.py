@@ -16,7 +16,7 @@ import torch
 
 from astrolabe.config import RaceTrainConfig
 from astrolabe.model import GPT, GPTConfig, HierarchicalRiskGPT
-from astrolabe.race_dataset import _pad_sequence as pad_sequence
+from astrolabe.race_dataset import _pad_sequence as pad_sequence, _positions_to_vec, _sync_positions
 from astrolabe.vocab import BOS_ID, PAD_ID, TOKEN_TO_ID, VOCAB_SIZE
 
 
@@ -192,7 +192,7 @@ def _detect_race_file(
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     gpt_cfg = GPTConfig(**ckpt["gpt_cfg"])
     model = HierarchicalRiskGPT(gpt_cfg).to(device)
-    model.load_state_dict(ckpt["model"])
+    model.load_state_dict(ckpt["model"], strict=False)
     model.eval()
     cfg = RaceTrainConfig()
 
@@ -206,13 +206,17 @@ def _detect_race_file(
         project_index = _project_function_index(project, tokenizer)
 
     findings: list[tuple[str, int, str, float, int | None]] = []
-    for func_name, target_tokens, start, _ in extract_function_units(file_path, tokenizer):
+    for func_name, target_tokens, start, ann in extract_function_units(file_path, tokenizer):
         target_ids, target_mask = pad_sequence(
             [min(TOKEN_TO_ID.get(t, PAD_ID), VOCAB_SIZE - 1) for t in target_tokens],
             cfg.func_len,
         )
         target_ids_t = torch.from_numpy(target_ids).unsqueeze(0).to(device)
         target_mask_t = torch.from_numpy(target_mask).unsqueeze(0).to(device)
+
+        sync_positions = _sync_positions(ann)
+        target_sync_mask = _positions_to_vec(sorted(sync_positions), cfg.func_len).astype(np.int64)
+        target_sync_mask_t = torch.from_numpy(target_sync_mask).unsqueeze(0).to(device)
 
         caller_ids = torch.full((1, cfg.max_callers, cfg.caller_len), PAD_ID, dtype=torch.long, device=device)
         caller_mask = torch.zeros((1, cfg.max_callers, cfg.caller_len), dtype=torch.bool, device=device)
@@ -234,7 +238,8 @@ def _detect_race_file(
 
         with torch.no_grad():
             preds = model.detect_race(
-                target_ids_t, caller_ids, target_mask_t, caller_mask, caller_present, threshold=threshold
+                target_ids_t, caller_ids, target_mask_t, caller_mask, caller_present,
+                target_sync_mask=target_sync_mask_t, threshold=threshold
             )
 
         for pos, conf in preds:

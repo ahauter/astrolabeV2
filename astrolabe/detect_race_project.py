@@ -14,12 +14,13 @@ import subprocess
 import sys
 from pathlib import Path
 
+import numpy as np
 import torch
 
 from astrolabe.config import RaceTrainConfig
 from astrolabe.detect import extract_function_units, tokenize_go_file
 from astrolabe.model import GPTConfig, HierarchicalRiskGPT
-from astrolabe.race_dataset import _pad_sequence as pad_sequence
+from astrolabe.race_dataset import _pad_sequence as pad_sequence, _positions_to_vec, _sync_positions
 from astrolabe.vocab import PAD_ID, TOKEN_TO_ID, VOCAB_SIZE
 
 
@@ -32,7 +33,7 @@ def load_model(checkpoint_path: Path, device: str) -> HierarchicalRiskGPT:
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     gpt_cfg = GPTConfig(**ckpt["gpt_cfg"])
     model = HierarchicalRiskGPT(gpt_cfg).to(device)
-    model.load_state_dict(ckpt["model"])
+    model.load_state_dict(ckpt["model"], strict=False)
     model.eval()
     return model
 
@@ -100,10 +101,14 @@ def detect_function(
     target = func_index.get(func_name)
     if target is None:
         return None
-    go_file, target_tokens, _, _ = target
+    go_file, target_tokens, _, ann = target
     target_ids, target_mask = pad_sequence(tokens_to_ids(target_tokens), cfg.func_len)
     target_ids_t = torch.from_numpy(target_ids).unsqueeze(0).to(device)
     target_mask_t = torch.from_numpy(target_mask).unsqueeze(0).to(device)
+
+    sync_positions = _sync_positions(ann)
+    target_sync_mask = _positions_to_vec(sorted(sync_positions), cfg.func_len).astype(np.int64)
+    target_sync_mask_t = torch.from_numpy(target_sync_mask).unsqueeze(0).to(device)
 
     caller_ids = torch.full((1, cfg.max_callers, cfg.caller_len), PAD_ID, dtype=torch.long, device=device)
     caller_mask = torch.zeros((1, cfg.max_callers, cfg.caller_len), dtype=torch.bool, device=device)
@@ -122,7 +127,8 @@ def detect_function(
 
     with torch.no_grad():
         preds = model.detect_race(
-            target_ids_t, caller_ids, target_mask_t, caller_mask, caller_present, threshold=threshold
+            target_ids_t, caller_ids, target_mask_t, caller_mask, caller_present,
+            target_sync_mask=target_sync_mask_t, threshold=threshold
         )
 
     return [
