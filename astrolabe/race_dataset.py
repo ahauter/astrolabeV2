@@ -95,6 +95,7 @@ class RaceContextDataset(Dataset):
         caller_len: int = 128,
         max_callers: int = 8,
         mutate_frac: float = 0.2,
+        unlock_mutate_frac: float = 0.0,
         sync_neg_weight: float = 5.0,
         seed: int = 0,
         deterministic: bool = False,
@@ -133,10 +134,14 @@ class RaceContextDataset(Dataset):
         if self.static_race_offsets is not None and len(self.static_race_offsets) - 1 != self.n_units:
             raise ValueError("mismatch between units and static race risk file")
 
+        if mutate_frac + unlock_mutate_frac > 1.0:
+            raise ValueError("mutate_frac + unlock_mutate_frac must be <= 1.0")
+
         self.func_len = func_len
         self.caller_len = caller_len
         self.max_callers = max_callers
         self.mutate_frac = mutate_frac
+        self.unlock_mutate_frac = unlock_mutate_frac
         self.sync_neg_weight = sync_neg_weight
         self.seed = seed
         self.deterministic = deterministic
@@ -146,14 +151,20 @@ class RaceContextDataset(Dataset):
     def __len__(self) -> int:
         return self.epoch_samples
 
-    def _should_mutate(self, idx: int, ann: dict) -> bool:
+    def _select_mutation(self, idx: int, ann: dict) -> str:
+        """Return mutation mode for this sample: 'none', 'all', or 'unlock'."""
         if not ann.get("sync"):
-            return False
+            return "none"
         if self.deterministic:
             rng = np.random.default_rng(self.seed ^ idx)
         else:
             rng = self._rng
-        return rng.random() < self.mutate_frac
+        r = rng.random()
+        if r < self.mutate_frac:
+            return "all"
+        if r < self.mutate_frac + self.unlock_mutate_frac:
+            return "unlock"
+        return "none"
 
     def _load_unit(self, idx: int) -> list[int]:
         start = int(self.offsets[idx])
@@ -185,11 +196,12 @@ class RaceContextDataset(Dataset):
         risk = self._risk(idx)
 
         original_tokens = self._load_unit(idx)
-        mutate = self._should_mutate(idx, ann)
+        mutation = self._select_mutation(idx, ann)
         static_race = self._static_race(idx).get("race_risks", [])
         sync_positions = _sync_positions(ann)
+        unlock_positions = _unlock_positions(ann)
 
-        if mutate:
+        if mutation == "all":
             target_tokens, pos_map = _remove_positions(original_tokens, sync_positions)
             mutated_race = _race_labels(original_tokens, target_tokens, pos_map, ann)
             static_race_mapped = _map_positions(static_race, pos_map)
@@ -197,6 +209,23 @@ class RaceContextDataset(Dataset):
             nil_labels = _map_positions(risk.get("nil_risks", []), pos_map)
             bounds_labels = _map_positions(risk.get("bounds_risks", []), pos_map)
             target_sync_labels: list[int] = []
+        elif mutation == "unlock":
+            # Fall back to no mutation if there are no unlocks to strip.
+            if not unlock_positions:
+                target_tokens = original_tokens
+                race_labels = static_race
+                nil_labels = risk.get("nil_risks", [])
+                bounds_labels = risk.get("bounds_risks", [])
+                target_sync_labels = sorted(sync_positions)
+            else:
+                target_tokens, pos_map = _remove_positions(original_tokens, unlock_positions)
+                mutated_race = _race_labels(original_tokens, target_tokens, pos_map, ann)
+                static_race_mapped = _map_positions(static_race, pos_map)
+                race_labels = sorted(set(mutated_race) | set(static_race_mapped))
+                nil_labels = _map_positions(risk.get("nil_risks", []), pos_map)
+                bounds_labels = _map_positions(risk.get("bounds_risks", []), pos_map)
+                # Locks/atomics remain; sync mask covers them as hard negatives.
+                target_sync_labels = sorted(sync_positions - unlock_positions)
         else:
             target_tokens = original_tokens
             race_labels = static_race
@@ -257,6 +286,16 @@ def _sync_positions(ann: dict) -> set[int]:
     for ev in ann.get("sync", []):
         for p in range(ev["start"], ev["end"] + 1):
             positions.add(p)
+    return positions
+
+
+def _unlock_positions(ann: dict) -> set[int]:
+    """Return token positions occupied by Unlock / RUnlock calls."""
+    positions: set[int] = set()
+    for ev in ann.get("sync", []):
+        if ev.get("kind") in {"unlock", "runlock"}:
+            for p in range(ev["start"], ev["end"] + 1):
+                positions.add(p)
     return positions
 
 

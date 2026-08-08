@@ -124,6 +124,10 @@ class RaceTrainConfig:
     # sync hard-negative weighting
     sync_neg_weight: float = 5.0
 
+    # online mutation fractions (must sum to <= 1.0)
+    mutate_frac: float = 0.2
+    unlock_mutate_frac: float = 0.0
+
     # freeze schedule
     freeze_backbone_steps: int = 1000
 
