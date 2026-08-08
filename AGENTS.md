@@ -1,8 +1,8 @@
 # Agent Notes — Astrolabe Race-Condition POC
 
 This workspace is a proof-of-concept for detecting Go data races with a small
-hierarchical Transformer. It sits on top of the existing nil-deref / bounds-check
-risk model.
+hierarchical Transformer scaffolded off static analysis. It sits on top of the
+existing nil-deref / bounds-check risk model.
 
 ## Repository Layout
 
@@ -12,7 +12,8 @@ risk model.
 - `astrolabe/dataset.py` — `CFGUnitMixDataset` for pretraining over declaration units.
 - `astrolabe/risk_miner.py` — static miner for nil-deref and bounds-check risk positions.
 - `astrolabe/risk_dataset.py` — `RiskUnitDataset` for nil/bounds fine-tuning.
-- `astrolabe/race_dataset.py` — `RaceContextDataset`: target function + up to 8 depth-1 callers, with **online** sync removal. Uses line-offset sidecars (`.idx.npy`) to avoid loading annotation/meta/risk JSONL files into memory.
+- `astrolabe/race_miner.py` — static miner for race-risk positions in no-sync functions under concurrent contexts.
+- `astrolabe/race_dataset.py` — `RaceContextDataset`: target function + up to 8 depth-1 callers, with **online** sync removal plus static race labels and sync-range hard-negative weighting. Uses line-offset sidecars (`.idx.npy`) to avoid loading annotation/meta/risk JSONL files into memory.
 - `astrolabe/prepare_v2.py` — parallel tokenizer that builds the unified base corpus.
 - `astrolabe/build_race_meta.py` — builds caller-index metadata for the race dataloader.
 - `astrolabe/prepare_race.py` — legacy offline race-corpus builder (kept for reference; the active pipeline uses online mutation).
@@ -93,14 +94,46 @@ This writes `data_v1/race_train_meta.jsonl` and `data_v1/race_val_meta.jsonl`.
 To keep memory low it builds a one-time SQLite lookup table at
 `data_v1/callgraph.db` and streams the annotation files twice.
 
-## Race Mutation Strategy
+### 5. Static Race Labels
 
-The race dataloader (`RaceContextDataset`) mutates sequences **online**:
+```bash
+python -m astrolabe.race_miner \
+    --units data_v1/train_units.bin \
+    --idx   data_v1/train_units.idx.npy \
+    --ann   data_v1/train_ann.jsonl \
+    --meta  data_v1/race_train_meta.jsonl \
+    --out   data_v1/race_risk_train.jsonl
 
-- Every target function is loaded with its sync calls intact (negative).
-- With probability 0.5, all sync calls are stripped and the previously-protected
-  risky shared accesses are labeled as race positives.
-- Non-concurrency functions (no sync events) are always negatives.
+python -m astrolabe.race_miner \
+    --units data_v1/val_units.bin \
+    --idx   data_v1/val_units.idx.npy \
+    --ann   data_v1/val_ann.jsonl \
+    --meta  data_v1/race_val_meta.jsonl \
+    --out   data_v1/race_risk_val.jsonl
+```
+
+This writes `data_v1/race_risk_train.jsonl` and `data_v1/race_risk_val.jsonl`.
+A no-sync function is labeled with its risky external uses when it (or any
+depth-1 caller) contains a `go` statement. Functions with internal sync are left
+to the online mutation dataloader.
+
+## Race Labeling Strategy
+
+The race dataloader (`RaceContextDataset`) combines static labels with online
+mutation:
+
+- **Static labels**: no-sync functions that are reachable from a goroutine spawn
+  are labeled with their risky external uses.
+- **Online mutation**: with probability 0.2, functions containing sync primitives
+  have those calls stripped and the previously-protected risky shared accesses are
+  labeled as race positives.
+- **Hybrid union**: mutated samples include both stripped-sync positives and any
+  static no-sync positives.
+- **Sync-range hard negatives**: in non-mutated samples with sync, positions inside
+  sync events receive higher loss weight, teaching the model that those token
+  ranges are protected.
+- **Sync mask input**: the model receives a binary `sync_mask` per target position,
+  giving it explicit scaffolding for synchronization boundaries.
 - Callers are kept original so the L2 context still sees goroutine spawns.
 
 This avoids duplicating the entire corpus on disk and explicitly teaches the model
@@ -113,8 +146,12 @@ Resume from the pretrained risk checkpoint:
 ```bash
 python -m astrolabe.finetune_race \
     --data-dir data_v1 \
-    --out-dir checkpoints_race \
-    --resume checkpoints_risk/ckpt_risk_5000.pt
+    --out-dir checkpoints_race_v3 \
+    --resume-ckpt checkpoints_race_v2/ckpt_race_15000.pt \
+    --max-steps 20000 \
+    --lr 5e-5 \
+    --min-lr 5e-6 \
+    --warmup-steps 100
 ```
 
 Resume an in-progress race checkpoint:
@@ -122,14 +159,15 @@ Resume an in-progress race checkpoint:
 ```bash
 python -m astrolabe.finetune_race \
     --data-dir data_v1 \
-    --out-dir checkpoints_race \
-    --resume-ckpt checkpoints_race/ckpt_race_2000.pt \
-    --max-steps 5000
+    --out-dir checkpoints_race_v3 \
+    --resume-ckpt checkpoints_race_v3/ckpt_race_18000.pt \
+    --max-steps 20000
 ```
 
-The current best race checkpoint (`checkpoints_race/ckpt_race_10000.pt`) was
-resumed from `ckpt_race_5400.pt` and trained to 10,000 steps on the full
-`data_v1` corpus with online mutation.
+The current best race checkpoint (`checkpoints_race_v3/ckpt_race_20000.pt`) was
+resumed from `checkpoints_race_v2/ckpt_race_15000.pt` (which itself was trained
+with static labels) and trained to 20,000 steps with sync-mask input and
+sync-range hard-negative weighting.
 
 ## Evaluation
 
@@ -137,7 +175,7 @@ Reserved validation corpus:
 
 ```bash
 python -m astrolabe.eval_race_val \
-    --checkpoint checkpoints_race/ckpt_race_10000.pt \
+    --checkpoint checkpoints_race_v3/ckpt_race_20000.pt \
     --data-dir data_v1 \
     --samples 2000
 ```
@@ -147,18 +185,18 @@ Live project scan:
 ```bash
 python -m astrolabe.detect_race_project \
     --project ../../PolyScam/main \
-    --checkpoint checkpoints_race/ckpt_race_10000.pt \
-    --threshold 0.2
+    --checkpoint checkpoints_race_v3/ckpt_race_20000.pt \
+    --threshold 0.02
 ```
 
 Single-file race inference:
 
 ```bash
 python -m astrolabe.detect --kind race \
-    --checkpoint checkpoints_race/ckpt_race_10000.pt \
+    --checkpoint checkpoints_race_v3/ckpt_race_20000.pt \
     --file some_file.go \
     --project project_root \
-    --threshold 0.2
+    --threshold 0.02
 ```
 
 ## Important Caveats
@@ -168,5 +206,8 @@ python -m astrolabe.detect --kind race \
   internal synchronization but concurrent external callers.
 - Caller context is depth-1 only and uses a static AST call graph, so indirect
   calls (interfaces, function values, reflection) are invisible.
+- The sync mask marks the **token span of each sync call**, not the full
+  caller-holds-lock critical section. Functions like `rotateBook` that are called
+  under a lock held by their caller may still be flagged.
 - High-confidence findings should be treated as candidates, not confirmed bugs;
   verify with `go run -race` or static analyzers.
