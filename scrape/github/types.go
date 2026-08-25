@@ -265,3 +265,14 @@ type BlobResponse struct {
 	Content  string `json:"content"`
 	Encoding string `json:"encoding"`
 }
+
+type CommitInfo struct {
+	Sha string `json:"sha"`
+	Url string `json:"url"`
+}
+
+type BranchInfo struct {
+	Name      string     `json:"name"`
+	Commit    CommitInfo `json:"commit"`
+	Protected bool       `json:"protected"`
+}
