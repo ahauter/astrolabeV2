@@ -34,3 +34,4 @@ synth_eval/
 
 # Claude
 .claude
+out/*
