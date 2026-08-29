@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"path"
 	"strings"
 
@@ -81,36 +83,6 @@ func super_cool_function_that_is_super_cool(lang, license string) {
 	return
 }
 
-type RepoMetadata struct {
-	Id      string
-	Commits []string
-}
-
-type ScraperState struct {
-	SeenRepos []string
-}
-
-func (s *ScraperState) Load(path string) error {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return err
-	}
-	err = json.Unmarshal(data, s)
-	if err != nil {
-		return err
-	}
-	return nil
-}
-
-func (s *ScraperState) Save(path string) error {
-	raw_data, err := json.Marshal(s)
-	if err != nil {
-		return err
-	}
-	err = os.WriteFile(path, raw_data, 0644)
-	return err
-}
-
 func exists(dir string) bool {
 	_, err := os.Stat(dir)
 	if err == nil {
@@ -130,7 +102,7 @@ func main() {
 		return
 	}
 
-	var scraper ScraperState
+	var scraper scrape.ScraperState
 	out_dir := os.Args[1]
 	if !exists(out_dir) {
 		fmt.Printf("Directory %s not found, creating new directory!\n", out_dir)
@@ -139,16 +111,15 @@ func main() {
 	statepath := path.Join(out_dir, state_name)
 	if exists(statepath) {
 		err := scraper.Load(statepath)
-		fmt.Println(scraper.SeenRepos[0])
 		if err != nil {
 			fmt.Println(err.Error())
 			fmt.Println("Above error occurred while trying to load scraper state; exiting")
 			return
 		}
 	}
-
+	ctx, _ := signal.NotifyContext(context.Background(), os.Interrupt)
 	//super_cool_function_that_is_super_cool(language, license)
-	scraper.SeenRepos = append(scraper.SeenRepos, "HelloIAmARepoHash")
+	scraper.Start(ctx, language, license)
 	err := scraper.Save(statepath)
 	if err != nil {
 		fmt.Println("Scraper state attempted to save and encountered the following error:")
