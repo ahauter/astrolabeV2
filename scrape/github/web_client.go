@@ -39,8 +39,13 @@ func (rrt *RetryRoundTripper) RoundTrip(req *http.Request) (*http.Response, erro
 				}
 			}
 		}
-		// retry after backoff
-		time.Sleep(backoff)
+		select {
+		case <-req.Context().Done():
+			return nil, errors.New("Context cancelled before request can be completed")
+			// retry after backoff
+		default:
+			time.Sleep(backoff)
+		}
 	}
 	return nil, errors.New("Hit max retries with request")
 }

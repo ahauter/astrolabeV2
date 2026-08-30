@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	scrape "github.com/ahauter/astrolabev2/scrape/github"
 	"io"
 	"net/http"
 	"net/url"
@@ -12,8 +13,6 @@ import (
 	"os/signal"
 	"path"
 	"strings"
-
-	scrape "github.com/ahauter/astrolabev2/scrape/github"
 )
 
 const search_endpoint = "https://api.github.com/search/repositories"
@@ -63,7 +62,7 @@ func super_cool_function_that_is_super_cool(lang, license string) {
 	fmt.Println(u.String())
 	var results scrape.RepoSearchResponse
 	getDaJSON(u.String(), &results)
-	fmt.Println(results.Items[0].BranchesURL)
+	//fmt.Println(results.Items[0].BranchesURL)
 	fmt.Println(results.Items[0].TreesURL)
 	new_url := strings.Split(results.Items[0].BranchesURL, "{")[0]
 	var results2 []scrape.BranchInfo
@@ -83,6 +82,10 @@ func super_cool_function_that_is_super_cool(lang, license string) {
 	return
 }
 
+const state_name = "state.json"
+const language = "go"
+const license = "mit"
+
 func exists(dir string) bool {
 	_, err := os.Stat(dir)
 	if err == nil {
@@ -90,12 +93,8 @@ func exists(dir string) bool {
 	}
 	return os.IsExist(err)
 }
-
-const state_name = "state.json"
-const language = "go"
-const license = "mit"
-
 func main() {
+	//super_cool_function_that_is_super_cool(language, license)
 	if len(os.Args) < 2 {
 		fmt.Printf("Error! Not enough command line arguments!")
 		fmt.Printf("Usage: ./scrape <out directory>")
@@ -119,7 +118,7 @@ func main() {
 	}
 	ctx, _ := signal.NotifyContext(context.Background(), os.Interrupt)
 	//super_cool_function_that_is_super_cool(language, license)
-	scraper.Start(ctx, language, license)
+	scraper.Start(ctx, language, license, out_dir)
 	err := scraper.Save(statepath)
 	if err != nil {
 		fmt.Println("Scraper state attempted to save and encountered the following error:")
