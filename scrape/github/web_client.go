@@ -84,6 +84,5 @@ func NewClient(api_key string, logger *slog.Logger) http.Client {
 	rrt := NewRetryRoundTripper(10, api_key, time.Minute, logger)
 	return http.Client{
 		Transport: &rrt,
-		Timeout:   10 * time.Second,
 	}
 }
