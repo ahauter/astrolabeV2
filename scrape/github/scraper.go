@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"golang.org/x/sync/errgroup"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -31,10 +32,18 @@ func ContentByte(s *BlobResponse) []byte {
 }
 
 type ScraperState struct {
-	ApiKey       string
-	SeenRepos    []RepoMetadata
-	OutPath      string
-	AllowedPaths []string
+	ApiKey       string         `json:"api_key"`
+	SeenRepos    []RepoMetadata `json:"seen_repos"`
+	OutPath      string         `json:"out_path"`
+	AllowedPaths []string       `json:"allowed_paths"`
+	Logger       *slog.Logger   `json:"-"`
+}
+
+func (s *ScraperState) logger() *slog.Logger {
+	if s.Logger != nil {
+		return s.Logger
+	}
+	return slog.Default()
 }
 
 func (s *ScraperState) getSnapshot() map[int]map[string]bool {
@@ -70,26 +79,25 @@ const num_workers = 8 // todo make this configurable
 
 const search_endpoint = "https://api.github.com/search/repositories"
 
-func _mkdir(path string) {
-	if !exists(path) {
-		fmt.Printf("Directory %s not found, creating new directory!\n", path)
-		os.Mkdir(path, 0755)
-	} else {
-		return
+func _mkdir(logger *slog.Logger, p string) {
+	if !exists(p) {
+		logger.Info("creating directory", "path", p)
+		os.Mkdir(p, 0755)
 	}
 }
 
 func _try_fetch(ctx context.Context, client *http.Client, url string, ptr any) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
 	resp, err := client.Do(req)
 	if err != nil {
-		fmt.Println(err.Error())
 		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
-		fmt.Println(resp.Status)
-		return errors.New("Request status unexpected")
+		return errors.New("Request status unexpected: " + resp.Status)
 	}
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -105,14 +113,18 @@ func _try_fetch(ctx context.Context, client *http.Client, url string, ptr any) e
 func downloadBlob(
 	ctx context.Context, client *http.Client,
 	url string, path string,
+	logger *slog.Logger,
 ) error {
+	logger.Debug("downloading blob", "url", url)
 	var blob BlobResponse
 	err := _try_fetch(ctx, client, url, &blob)
 	if err != nil {
+		logger.Error("blob download failed", "url", url, "error", err)
 		return err
 	}
 	os.WriteFile(path, ContentByte(&blob), 0644)
-	return err
+	logger.Debug("blob downloaded", "path", path, "size", blob.Size)
+	return nil
 }
 
 func (s *ScraperState) treeWorker(
@@ -120,9 +132,12 @@ func (s *ScraperState) treeWorker(
 	root TreeResponse,
 	client *http.Client,
 	basePath string,
+	logger *slog.Logger,
 ) error {
 	wg, ctx := errgroup.WithContext(ctx)
 	wg.SetLimit(16)
+	logger = logger.With("base_path", basePath)
+	logger.Info("downloading tree", "entries", len(root.Tree))
 	for _, entry := range root.Tree {
 		select {
 		case <-ctx.Done():
@@ -132,7 +147,7 @@ func (s *ScraperState) treeWorker(
 			e_path := path.Join(basePath, entry.Path)
 			if entry.Size == nil {
 				// tree entry
-				_mkdir(e_path)
+				_mkdir(logger, e_path)
 				continue
 			}
 			if !s.Allowed(entry.Path) {
@@ -142,6 +157,7 @@ func (s *ScraperState) treeWorker(
 				return downloadBlob(
 					ctx, client,
 					entry.URL, e_path,
+					logger.With("path", entry.Path),
 				)
 			})
 		}
@@ -157,30 +173,34 @@ func (s *ScraperState) repoWorker(
 	jobs chan RepoItem,
 	snapshot map[int]map[string]bool,
 ) {
+	logger := s.logger()
 	defer wg.Done()
-	//todo open path and check for our repo
 	var completed RepoMetadata
 	for targetRepo := range jobs {
-		// list branches
+		repoLogger := logger.With("repo", targetRepo.Name, "repo_id", targetRepo.ID)
+		repoLogger.Info("processing repo")
 		branchesUrl := strings.Split(targetRepo.BranchesURL, "{")[0]
 		repo_path := path.Join(s.OutPath, targetRepo.Name)
 		completed = RepoMetadata{
 			Id: targetRepo.ID,
 		}
-		_mkdir(repo_path)
+		_mkdir(repoLogger, repo_path)
 		var branches []BranchInfo
 		err := _try_fetch(ctx, client, branchesUrl, &branches)
 		if err != nil {
+			repoLogger.Error("failed to fetch branches", "error", err)
 			continue
 		}
 		for _, commit := range branches {
 			var commitResp CommitResponse
 			err = _try_fetch(ctx, client, commit.Commit.Url, &commitResp)
 			if err != nil {
+				repoLogger.Warn("failed to fetch commit", "commit_sha", commit.Commit.Sha, "error", err)
 				continue
 			}
 			tree_url, err := url.Parse(commitResp.Commit.Tree.URL)
 			if err != nil {
+				repoLogger.Warn("failed to parse tree url", "commit_sha", commit.Commit.Sha, "error", err)
 				continue
 			}
 			tree_params := url.Values{}
@@ -189,22 +209,25 @@ func (s *ScraperState) repoWorker(
 			var treeResp TreeResponse
 			err = _try_fetch(ctx, client, tree_url.String(), &treeResp)
 			if err != nil {
+				repoLogger.Warn("failed to fetch tree", "commit_sha", commit.Commit.Sha, "error", err)
 				continue
 			}
 			sha := commitResp.Commit.Tree.SHA
 			commit_path := path.Join(repo_path)
-			//check for completion of this particular branch
 			if isCommitComplete(targetRepo.ID, sha, snapshot) {
+				repoLogger.Info("skipping completed commit", "commit_sha", sha)
 				continue
 			}
 
-			if err := s.treeWorker(ctx, treeResp, client, commit_path); err != nil {
+			if err := s.treeWorker(ctx, treeResp, client, commit_path, repoLogger.With("commit_sha", sha)); err != nil {
+				repoLogger.Error("tree worker failed", "commit_sha", sha, "error", err)
 				continue
 			}
 			completed.Commits = append(completed.Commits, sha)
 		}
 		select {
 		case results <- completed:
+			repoLogger.Info("repo finished", "commits_processed", len(completed.Commits))
 		case <-ctx.Done():
 			return
 		}
@@ -216,42 +239,46 @@ func (s *ScraperState) Start(
 	lang, lic string,
 	outpath string,
 ) error {
+	logger := s.logger()
 	if outpath != "" {
 		s.OutPath = outpath
 	}
-	client := NewClient(s.ApiKey)
+	logger.Info("initializing scraper", "out_path", s.OutPath, "language", lang, "license", lic)
+	client := NewClient(s.ApiKey, logger)
 	// get the repos
 	q := fmt.Sprintf(
 		"license:%s language:%s", lic, lang,
 	)
 	params := url.Values{}
 	params.Add("q", q)
-	fmt.Println(params)
 	u, _ := url.Parse(search_endpoint)
 	u.RawQuery = params.Encode()
-	fmt.Println(u.String())
+	logger.Info("searching repositories", "query", q, "url", u.String())
 	resp, err := client.Get(u.String())
 	// TODO handle error more gracefully? we're already retrying so maybe this is ok
 	if err != nil {
-		fmt.Println(err.Error())
+		logger.Error("search request failed", "error", err)
 		panic("Search unavaible, cannot restart scraping")
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
-		fmt.Println(resp.Status)
+		logger.Error("search returned non-200 status", "status", resp.Status)
 		panic("Could not get da body status is bad")
 	}
 	var repoInfo RepoSearchResponse
 	body, _ := io.ReadAll(resp.Body)
 	err = json.Unmarshal(body, &repoInfo)
 	if err != nil {
+		logger.Error("failed to parse search response", "error", err)
 		panic("Could not search for new repositories, try again later")
 	}
+	logger.Info("search completed", "total_count", repoInfo.TotalCount, "incomplete_results", repoInfo.IncompleteResults, "repos_found", len(repoInfo.Items))
 
 	completedSnap := s.getSnapshot()
 	results := make(chan RepoMetadata, num_workers)
 	jobs := make(chan RepoItem, num_workers)
 	var wg sync.WaitGroup
+	logger.Info("starting workers", "num_workers", num_workers)
 	for i := 0; i < num_workers; i++ {
 		wg.Add(1)
 		go s.repoWorker(ctx, &wg, &client, results, jobs, completedSnap)
@@ -271,8 +298,14 @@ func (s *ScraperState) Start(
 		close(results)
 	}()
 
+	completedCount := 0
+	totalCount := len(repoInfo.Items)
 	for completed := range results {
-		//assume completed > what we've seen
+		completedCount++
+		logger.Info("repo completed",
+			"progress", fmt.Sprintf("%d/%d", completedCount, totalCount),
+			"repo_id", completed.Id,
+			"commits", len(completed.Commits))
 		seen := false
 		for i, c := range s.SeenRepos {
 			if completed.Id == c.Id {
@@ -284,6 +317,7 @@ func (s *ScraperState) Start(
 			s.SeenRepos = append(s.SeenRepos, completed)
 		}
 	}
+	logger.Info("all repos completed", "total", completedCount)
 	return nil
 }
 
