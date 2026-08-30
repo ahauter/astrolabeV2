@@ -100,7 +100,7 @@ func exists(dir string) bool {
 	return os.IsExist(err)
 }
 func main() {
-	super_cool_function_that_is_super_cool(language, license)
+	//super_cool_function_that_is_super_cool(language, license)
 	if len(os.Args) < 2 {
 		fmt.Printf("Error! Not enough command line arguments!")
 		fmt.Printf("Usage: ./scrape <out directory>")

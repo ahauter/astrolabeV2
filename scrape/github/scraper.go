@@ -121,11 +121,12 @@ func (s *ScraperState) treeWorker(
 	client *http.Client,
 	basePath string,
 ) error {
-	var wg errgroup.Group
+	wg, ctx := errgroup.WithContext(ctx)
 	wg.SetLimit(16)
 	for _, entry := range root.Tree {
 		select {
 		case <-ctx.Done():
+			wg.Wait()
 			return errors.New("Context is cancelled before tree could complete")
 		default:
 			e_path := path.Join(basePath, entry.Path)
@@ -174,7 +175,7 @@ func (s *ScraperState) repoWorker(
 		}
 		for _, commit := range branches {
 			var commitResp CommitResponse
-			err = _try_fetch(ctx, client, commit.Commit.Sha, &commitResp)
+			err = _try_fetch(ctx, client, commit.Commit.Url, &commitResp)
 			if err != nil {
 				continue
 			}
@@ -218,7 +219,7 @@ func (s *ScraperState) Start(
 	if outpath != "" {
 		s.OutPath = outpath
 	}
-	client := NewClient("")
+	client := NewClient(s.ApiKey)
 	// get the repos
 	q := fmt.Sprintf(
 		"license:%s language:%s", lic, lang,

@@ -17,7 +17,7 @@ type RetryRoundTripper struct {
 
 func (rrt *RetryRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	if rrt.apiKey != "" {
-		authHeader := fmt.Sprintf("Bearer: %s", rrt.apiKey)
+		authHeader := fmt.Sprintf("Bearer %s", rrt.apiKey)
 		req.Header.Set("Authorization", authHeader)
 	}
 	for i := 0; i <= rrt.maxRetries; i++ {
@@ -28,7 +28,7 @@ func (rrt *RetryRoundTripper) RoundTrip(req *http.Request) (*http.Response, erro
 			if resp.StatusCode == http.StatusOK {
 				return resp, err
 			}
-			if resp.StatusCode == http.StatusTooManyRequests {
+			if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == 403 {
 				if rateLim, exists := resp.Header["X-RateLimit-Reset"]; exists {
 					reset_time, err := strconv.Atoi(rateLim[0])
 					if err != nil {
