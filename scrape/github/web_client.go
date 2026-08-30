@@ -1,7 +1,6 @@
 package github
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -22,7 +21,7 @@ func (rrt *RetryRoundTripper) RoundTrip(req *http.Request) (*http.Response, erro
 		req.Header.Set("Authorization", authHeader)
 	}
 	for i := 0; i <= rrt.maxRetries; i++ {
-		newReq := req.Clone(context.Background())
+		newReq := req.Clone(req.Context())
 		resp, err := rrt.transport.RoundTrip(newReq)
 		backoff := rrt.backoff
 		if err == nil {
@@ -39,12 +38,12 @@ func (rrt *RetryRoundTripper) RoundTrip(req *http.Request) (*http.Response, erro
 				}
 			}
 		}
+		tmr := time.NewTimer(backoff)
 		select {
 		case <-req.Context().Done():
 			return nil, errors.New("Context cancelled before request can be completed")
 			// retry after backoff
-		default:
-			time.Sleep(backoff)
+		case <-tmr.C:
 		}
 	}
 	return nil, errors.New("Hit max retries with request")

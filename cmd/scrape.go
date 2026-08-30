@@ -49,7 +49,6 @@ func ContentStr(s *scrape.BlobResponse) string {
 	return string(res)
 }
 
-// TODO previously visited repos skip
 func super_cool_function_that_is_super_cool(lang, license string) {
 	q := fmt.Sprintf(
 		"license:%s language:%s", license, lang,
@@ -71,8 +70,15 @@ func super_cool_function_that_is_super_cool(lang, license string) {
 	var commitResp scrape.CommitResponse
 	getDaJSON(newest_url, &commitResp)
 	newesest_url := commitResp.Commit.Tree.URL
+	tree_params := url.Values{}
+	tree_params.Add("recursive", "1")
+	tree_url, _ := url.Parse(newesest_url)
+	tree_url.RawQuery = tree_params.Encode()
 	var results_super_good_this_time scrape.TreeResponse
-	getDaJSON(newesest_url, &results_super_good_this_time)
+	getDaJSON(tree_url.String(), &results_super_good_this_time)
+	for _, tree_item := range results_super_good_this_time.Tree {
+		fmt.Println(tree_item.Path)
+	}
 	even_bestest_url_ever := results_super_good_this_time.Tree[0].URL
 	fmt.Println(even_bestest_url_ever)
 	fmt.Println(results_super_good_this_time.Tree[0].Path)
@@ -94,7 +100,7 @@ func exists(dir string) bool {
 	return os.IsExist(err)
 }
 func main() {
-	//super_cool_function_that_is_super_cool(language, license)
+	super_cool_function_that_is_super_cool(language, license)
 	if len(os.Args) < 2 {
 		fmt.Printf("Error! Not enough command line arguments!")
 		fmt.Printf("Usage: ./scrape <out directory>")
@@ -117,7 +123,6 @@ func main() {
 		}
 	}
 	ctx, _ := signal.NotifyContext(context.Background(), os.Interrupt)
-	//super_cool_function_that_is_super_cool(language, license)
 	scraper.Start(ctx, language, license, out_dir)
 	err := scraper.Save(statepath)
 	if err != nil {
