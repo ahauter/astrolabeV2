@@ -75,15 +75,16 @@ func exists(dir string) bool {
 	return os.IsExist(err)
 }
 
-const num_workers = 8 // todo make this configurable
+const num_workers = 4 // todo make this configurable
 
 const search_endpoint = "https://api.github.com/search/repositories"
 
-func _mkdir(logger *slog.Logger, p string) {
+func _mkdir(logger *slog.Logger, p string) error {
 	if !exists(p) {
 		logger.Info("creating directory", "path", p)
-		os.Mkdir(p, 0755)
+		return os.Mkdir(p, 0755)
 	}
+	return nil
 }
 
 func _try_fetch(ctx context.Context, client *http.Client, url string, ptr any) error {
@@ -135,7 +136,7 @@ func (s *ScraperState) treeWorker(
 	logger *slog.Logger,
 ) error {
 	wg, ctx := errgroup.WithContext(ctx)
-	wg.SetLimit(16)
+	wg.SetLimit(4)
 	logger = logger.With("base_path", basePath)
 	logger.Info("downloading tree", "entries", len(root.Tree))
 	for _, entry := range root.Tree {
@@ -147,7 +148,10 @@ func (s *ScraperState) treeWorker(
 			e_path := path.Join(basePath, entry.Path)
 			if entry.Size == nil {
 				// tree entry
-				_mkdir(logger, e_path)
+				err := _mkdir(logger, e_path)
+				if err != nil {
+					panic(fmt.Sprintf("Error making directory %s", e_path))
+				}
 				continue
 			}
 			if !s.Allowed(entry.Path) {
@@ -213,12 +217,16 @@ func (s *ScraperState) repoWorker(
 				continue
 			}
 			sha := commitResp.Commit.Tree.SHA
-			commit_path := path.Join(repo_path)
+			commit_path := path.Join(repo_path, sha)
 			if isCommitComplete(targetRepo.ID, sha, snapshot) {
 				repoLogger.Info("skipping completed commit", "commit_sha", sha)
 				continue
 			}
 
+			err = _mkdir(logger, commit_path)
+			if err != nil {
+				panic("Could not make directory " + commit_path)
+			}
 			if err := s.treeWorker(ctx, treeResp, client, commit_path, repoLogger.With("commit_sha", sha)); err != nil {
 				repoLogger.Error("tree worker failed", "commit_sha", sha, "error", err)
 				continue

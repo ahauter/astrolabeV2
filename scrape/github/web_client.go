@@ -2,7 +2,6 @@ package github
 
 import (
 	"errors"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -23,8 +22,9 @@ func (rrt *RetryRoundTripper) RoundTrip(req *http.Request) (*http.Response, erro
 		logger = slog.Default()
 	}
 	if rrt.apiKey != "" {
-		authHeader := fmt.Sprintf("Bearer %s", rrt.apiKey)
-		req.Header.Set("Authorization", authHeader)
+		req.Header.Set("Authorization", "Bearer "+rrt.apiKey)
+	} else {
+		panic("api key not good")
 	}
 	for i := 0; i <= rrt.maxRetries; i++ {
 		newReq := req.Clone(req.Context())
