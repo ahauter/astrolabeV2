@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"golang.org/x/sync/errgroup"
 	"io"
 	"net/http"
 	"net/url"
@@ -103,9 +104,8 @@ func _try_fetch(ctx context.Context, client *http.Client, url string, ptr any) e
 
 func downloadBlob(
 	ctx context.Context, client *http.Client,
-	wg *sync.WaitGroup, url string, path string,
+	url string, path string,
 ) error {
-	defer wg.Done()
 	var blob BlobResponse
 	err := _try_fetch(ctx, client, url, &blob)
 	if err != nil {
@@ -117,14 +117,16 @@ func downloadBlob(
 
 func (s *ScraperState) treeWorker(
 	ctx context.Context,
-	root TreeResponse, client *http.Client,
+	root TreeResponse,
+	client *http.Client,
 	basePath string,
-) {
-	var wg sync.WaitGroup
+) error {
+	var wg errgroup.Group
+	wg.SetLimit(16)
 	for _, entry := range root.Tree {
 		select {
 		case <-ctx.Done():
-			return
+			return errors.New("Context is cancelled before tree could complete")
 		default:
 			e_path := path.Join(basePath, entry.Path)
 			if entry.Size == nil {
@@ -135,14 +137,15 @@ func (s *ScraperState) treeWorker(
 			if !s.Allowed(entry.Path) {
 				continue
 			}
-			wg.Add(1)
-			go downloadBlob(
-				ctx, client, &wg,
-				entry.URL, e_path,
-			)
+			wg.Go(func() error {
+				return downloadBlob(
+					ctx, client,
+					entry.URL, e_path,
+				)
+			})
 		}
 	}
-	wg.Wait()
+	return wg.Wait()
 }
 
 func (s *ScraperState) repoWorker(
@@ -194,7 +197,9 @@ func (s *ScraperState) repoWorker(
 				continue
 			}
 
-			s.treeWorker(ctx, treeResp, client, commit_path)
+			if err := s.treeWorker(ctx, treeResp, client, commit_path); err != nil {
+				continue
+			}
 			completed.Commits = append(completed.Commits, sha)
 		}
 		select {
